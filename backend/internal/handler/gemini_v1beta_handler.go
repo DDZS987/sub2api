@@ -183,6 +183,13 @@ func (h *GatewayHandler) GeminiV1BetaModels(c *gin.Context) {
 		googleError(c, http.StatusBadRequest, "Request body is empty")
 		return
 	}
+	service.LogToolCallDebugGemini("handler.gemini_v1beta.models", "inbound_request", body,
+		"user_id", authSubject.UserID,
+		"api_key_id", apiKey.ID,
+		"group_id", apiKey.GroupID,
+		"model", modelName,
+		"action", action,
+	)
 
 	setOpsRequestContext(c, modelName, stream)
 	setOpsEndpointContext(c, "", int16(service.RequestTypeFromLegacy(stream, false)))

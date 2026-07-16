@@ -1699,6 +1699,18 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesOAuth(
 	if err != nil {
 		return nil, err
 	}
+	logger.LegacyPrintf(
+		"service.openai_gateway",
+		"[OpenAI] Images OAuth bridge request built request_model=%s endpoint=%s parsed_stream=%t response_format=%s uploads=%d upload_bytes=%d upstream_body_bytes=%d",
+		requestModel,
+		parsed.Endpoint,
+		parsed.Stream,
+		parsed.ResponseFormat,
+		len(parsed.Uploads),
+		openAIImagesUploadBytes(parsed),
+		len(responsesBody),
+	)
+
 	upstreamReq, err := s.buildUpstreamRequest(upstreamCtx, c, account, responsesBody, token, true, parsed.StickySessionSeed(), false)
 	if err != nil {
 		return nil, err
@@ -1715,6 +1727,20 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesOAuth(
 	SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
 	if err != nil {
 		safeErr := sanitizeUpstreamErrorMessage(err.Error())
+		logger.LegacyPrintf(
+			"service.openai_gateway",
+			"[OpenAI] Images OAuth upstream request failed account_id=%d request_model=%s endpoint=%s elapsed=%s err=%s request_ctx_err=%s upstream_ctx_err=%s uploads=%d upload_bytes=%d upstream_body_bytes=%d",
+			account.ID,
+			requestModel,
+			parsed.Endpoint,
+			time.Since(upstreamStart).Round(time.Millisecond),
+			safeErr,
+			contextErrString(ctx),
+			contextErrString(upstreamCtx),
+			len(parsed.Uploads),
+			openAIImagesUploadBytes(parsed),
+			len(responsesBody),
+		)
 		setOpsUpstreamError(c, 0, safeErr, "")
 		appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
 			Platform:           account.Platform,
@@ -1892,4 +1918,28 @@ func (s *OpenAIGatewayService) handleOpenAIImagesOAuthResponseError(
 		ResponseHeaders:        headers,
 		RetryableOnSameAccount: account.IsPoolMode() && account.IsPoolModeRetryableStatus(upstreamErr.StatusCode),
 	}
+}
+
+func openAIImagesUploadBytes(parsed *OpenAIImagesRequest) int {
+	if parsed == nil {
+		return 0
+	}
+	total := 0
+	for _, upload := range parsed.Uploads {
+		total += len(upload.Data)
+	}
+	if parsed.MaskUpload != nil {
+		total += len(parsed.MaskUpload.Data)
+	}
+	return total
+}
+
+func contextErrString(ctx context.Context) string {
+	if ctx == nil {
+		return "<nil>"
+	}
+	if err := ctx.Err(); err != nil {
+		return err.Error()
+	}
+	return ""
 }

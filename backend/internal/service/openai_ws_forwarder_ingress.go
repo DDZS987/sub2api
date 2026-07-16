@@ -253,8 +253,11 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			!isOpenAIResponsesLiteWebSocketPayload(normalized) &&
 			imageGenerationAllowed &&
 			codexImageGenerationExplicitToolPolicy != codexImageGenerationExplicitToolPolicyStrip &&
+			!codexClientUsesLocalImageGeneration(c) &&
+			!openAIRequestBodyHasCodexImageGenNamespace(normalized) &&
 			s.isCodexImageGenerationBridgeEnabled(ctx, account, apiKey)
 		if codexBridgeEnabled {
+			forceImageGeneration := isExplicitCodexImageGenerationUserRequest(normalized)
 			payloadMap := make(map[string]any)
 			if err := json.Unmarshal(normalized, &payloadMap); err != nil {
 				return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", err)
@@ -267,6 +270,10 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			if ensureOpenAIResponsesImageGenerationToolChoiceAuto(payloadMap) {
 				bridgeModified = true
 				logOpenAIWSModeInfo("ingress_ws_codex_image_tool_choice_auto account_id=%d", account.ID)
+			}
+			if forceImageGeneration && forceOpenAIResponsesImageGenerationToolChoice(payloadMap) {
+				bridgeModified = true
+				logOpenAIWSModeInfo("ingress_ws_codex_image_tool_choice_forced account_id=%d", account.ID)
 			}
 			if normalizeOpenAIResponsesImageGenerationTools(payloadMap) {
 				bridgeModified = true

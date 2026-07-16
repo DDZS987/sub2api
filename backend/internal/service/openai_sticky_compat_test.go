@@ -38,6 +38,73 @@ func TestGetStickySessionAccountID_FallbackToLegacyKey(t *testing.T) {
 	require.Equal(t, beforeFallbackHit+1, afterFallbackHit)
 }
 
+func TestGetStickySessionAccountID_AffinityScopeSkipsUnscopedAndLegacyKeys(t *testing.T) {
+	cache := &stubGatewayCache{
+		sessionBindings: map[string]int64{
+			"openai:new-hash":    41,
+			"openai:legacy-hash": 42,
+		},
+	}
+	svc := &OpenAIGatewayService{
+		cache: cache,
+		cfg: &config.Config{
+			Gateway: config.GatewayConfig{
+				OpenAIWS: config.GatewayOpenAIWSConfig{
+					SessionHashReadOldFallback: true,
+				},
+			},
+		},
+	}
+
+	ctx := withOpenAILegacySessionHash(context.Background(), "legacy-hash")
+	ctx = WithOpenAIStickyAffinityScope(ctx)
+	ctx = WithOpenAIAccountAffinity(ctx, OpenAIAccountAffinityAPIKey)
+	accountID, err := svc.getStickySessionAccountID(ctx, nil, "new-hash")
+	require.Error(t, err)
+	require.Zero(t, accountID)
+}
+
+func TestGetStickySessionAccountID_AffinityScopeReadsSingleScopedKey(t *testing.T) {
+	cache := &stubGatewayCache{
+		sessionBindings: map[string]int64{
+			"openai:new-hash":                 41,
+			"openai:new-hash:affinity:apikey": 42,
+			"openai:legacy-hash":              43,
+		},
+	}
+	svc := &OpenAIGatewayService{
+		cache: cache,
+		cfg: &config.Config{
+			Gateway: config.GatewayConfig{
+				OpenAIWS: config.GatewayOpenAIWSConfig{
+					SessionHashReadOldFallback: true,
+				},
+			},
+		},
+	}
+
+	ctx := withOpenAILegacySessionHash(context.Background(), "legacy-hash")
+	ctx = WithOpenAIStickyAffinityScope(ctx)
+	accountID, err := svc.getStickySessionAccountID(ctx, nil, "new-hash")
+	require.NoError(t, err)
+	require.Equal(t, int64(42), accountID)
+}
+
+func TestGetStickySessionAccountID_AffinityScopeDropsConflictingScopedKeys(t *testing.T) {
+	cache := &stubGatewayCache{
+		sessionBindings: map[string]int64{
+			"openai:new-hash:affinity:oauth":  41,
+			"openai:new-hash:affinity:apikey": 42,
+		},
+	}
+	svc := &OpenAIGatewayService{cache: cache}
+
+	ctx := WithOpenAIStickyAffinityScope(context.Background())
+	accountID, err := svc.getStickySessionAccountID(ctx, nil, "new-hash")
+	require.NoError(t, err)
+	require.Zero(t, accountID)
+}
+
 func TestSetStickySessionAccountID_DualWriteOldEnabled(t *testing.T) {
 	_, _, beforeDualWriteTotal := openAIStickyCompatStats()
 
@@ -61,6 +128,31 @@ func TestSetStickySessionAccountID_DualWriteOldEnabled(t *testing.T) {
 
 	_, _, afterDualWriteTotal := openAIStickyCompatStats()
 	require.Equal(t, beforeDualWriteTotal+1, afterDualWriteTotal)
+}
+
+func TestSetStickySessionAccountID_AffinityScopeWritesScopedKeyOnly(t *testing.T) {
+	cache := &stubGatewayCache{sessionBindings: map[string]int64{}}
+	svc := &OpenAIGatewayService{
+		cache: cache,
+		cfg: &config.Config{
+			Gateway: config.GatewayConfig{
+				OpenAIWS: config.GatewayOpenAIWSConfig{
+					SessionHashDualWriteOld: true,
+				},
+			},
+		},
+	}
+
+	ctx := withOpenAILegacySessionHash(context.Background(), "legacy-hash")
+	ctx = WithOpenAIStickyAffinityScope(ctx)
+	ctx = WithOpenAIAccountAffinity(ctx, OpenAIAccountAffinityAPIKey)
+	err := svc.setStickySessionAccountID(ctx, nil, "new-hash", 9, openaiStickySessionTTL)
+	require.NoError(t, err)
+	require.Equal(t, int64(9), cache.sessionBindings["openai:new-hash:affinity:apikey"])
+	_, unscopedExists := cache.sessionBindings["openai:new-hash"]
+	require.False(t, unscopedExists)
+	_, legacyExists := cache.sessionBindings["openai:legacy-hash"]
+	require.False(t, legacyExists)
 }
 
 func TestSetStickySessionAccountID_DualWriteOldDisabled(t *testing.T) {

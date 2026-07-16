@@ -277,21 +277,34 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	}
 
 	imageIntent := service.IsImageGenerationIntentForPlatform("/v1/responses", reqModel, body, openAICompatibleRequestPlatform(apiKey))
+	imageExecutionIntent := service.IsOpenAIResponsesImageGenerationExecutionIntent(reqModel, body)
 	if imageIntent && !service.GroupAllowsImageGeneration(apiKey.Group) {
 		h.errorResponse(c, http.StatusForbidden, "permission_error", service.ImageGenerationPermissionMessage())
 		return
 	}
 	var imageReleaseFunc func()
-	if imageIntent {
-		var imageAcquired bool
-		imageReleaseFunc, imageAcquired = h.acquireImageGenerationSlot(c, streamStarted)
-		if !imageAcquired {
-			return
+	imageSlotAcquired := false
+	acquireImageSlot := func() bool {
+		if imageSlotAcquired {
+			return true
 		}
-		if imageReleaseFunc != nil {
-			defer imageReleaseFunc()
+		release, acquired := h.acquireImageGenerationSlot(c, streamStarted)
+		if !acquired {
+			return false
 		}
+		imageReleaseFunc = release
+		imageSlotAcquired = true
+		return true
 	}
+	if imageIntent && !acquireImageSlot() {
+		return
+	}
+	defer func() {
+		if imageReleaseFunc != nil {
+			imageReleaseFunc()
+		}
+	}()
+	service.BindOpenAIImageGenerationSlotAcquirer(c, acquireImageSlot)
 
 	// 解析渠道级模型映射
 	channelMapping, _ := h.gatewayService.ResolveChannelMappingAndRestrict(c.Request.Context(), apiKey.GroupID, reqModel)
@@ -349,6 +362,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	sameAccountRetryCount := make(map[int64]int)
 	var lastFailoverErr *service.UpstreamFailoverError
 	var oauth429FailoverState service.OpenAIOAuth429FailoverState
+	requestCtx := service.WithOpenAIStickyAffinityScope(c.Request.Context())
 
 	// 生图意图的 /v1/responses 请求必须调度到确实支持 Responses API 的账号，否则
 	// 会在 forward 阶段被静默降级为无法生图的 Chat Completions 直转（#4417）。
@@ -356,6 +370,10 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	requiredCapability := service.OpenAIEndpointCapabilityChatCompletions
 	if imageIntent && requestPlatform == service.PlatformOpenAI {
 		requiredCapability = service.OpenAIEndpointCapabilityResponses
+	}
+	if imageExecutionIntent && requestPlatform == service.PlatformOpenAI {
+		requestCtx = service.WithOpenAIImageGenerationIntent(requestCtx)
+		requiredCapability = service.OpenAIEndpointCapabilityResponsesImageGeneration
 	}
 
 	for {
@@ -368,7 +386,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		// Select account supporting the requested model
 		reqLog.Debug("openai.account_selecting", zap.Int("excluded_account_count", len(failedAccountIDs)))
 		selection, scheduleDecision, err := h.gatewayService.SelectAccountWithSchedulerForCapability(
-			c.Request.Context(),
+			requestCtx,
 			apiKey.GroupID,
 			previousResponseID,
 			sessionHash,
@@ -431,11 +449,26 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			zap.Float64("load_skew", scheduleDecision.LoadSkew),
 		)
 		account := selection.Account
+		requestCtx = lockOpenAIAccountAffinity(requestCtx, account)
 		sessionHash = ensureOpenAIPoolModeSessionHash(sessionHash, account)
+		reqLog.Info("openai.account_affinity_locked",
+			zap.Int64("account_id", account.ID),
+			zap.String("account_type", account.Type),
+			zap.String("account_affinity", service.OpenAIAccountAffinityLogValue(service.OpenAIAccountAffinityForAccount(account))),
+			zap.String("locked_affinity", service.OpenAIAccountAffinityLogValue(service.OpenAIAccountAffinityFromContext(requestCtx))),
+			zap.Bool("sticky_affinity_scope", service.OpenAIStickyAffinityScopeEnabled(requestCtx)),
+			zap.String("schedule_layer", scheduleDecision.Layer),
+			zap.Bool("sticky_previous_hit", scheduleDecision.StickyPreviousHit),
+			zap.Bool("sticky_session_hit", scheduleDecision.StickySessionHit),
+			zap.Int("excluded_account_count", len(failedAccountIDs)),
+		)
 		reqLog.Debug("openai.account_selected", zap.Int64("account_id", account.ID), zap.String("account_name", account.Name))
 		setOpsSelectedAccount(c, account.ID, account.Platform)
+		if h.gatewayService.ShouldInjectCodexImageGenerationBridge(requestCtx, c, account, forwardBody) && !acquireImageSlot() {
+			return
+		}
 
-		accountReleaseFunc, acquired := h.acquireResponsesAccountSlot(c, apiKey.GroupID, sessionHash, selection, reqStream, &streamStarted, reqLog)
+		accountReleaseFunc, acquired := h.acquireResponsesAccountSlot(requestCtx, c, apiKey.GroupID, sessionHash, selection, reqStream, &streamStarted, reqLog)
 		if !acquired {
 			return
 		}
@@ -452,7 +485,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 					accountReleaseFunc()
 				}
 			}()
-			return h.gatewayService.Forward(c.Request.Context(), c, account, forwardBody)
+			return h.gatewayService.Forward(requestCtx, c, account, forwardBody)
 		}()
 		cyberBlockKeyHTTP := ""
 		if service.GetOpsCyberPolicy(c) != nil {
@@ -535,8 +568,12 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 						h.handleFailoverExhausted(c, failoverErr, streamStarted)
 						return
 					}
+					requestCtx = maybeReleaseOpenAIAccountAffinityOnFailover(requestCtx, failoverErr)
 					failoverSwitchFields := []zap.Field{
 						zap.Int64("account_id", account.ID),
+						zap.String("account_type", account.Type),
+						zap.String("account_affinity", service.OpenAIAccountAffinityLogValue(service.OpenAIAccountAffinityForAccount(account))),
+						zap.String("locked_affinity", service.OpenAIAccountAffinityLogValue(service.OpenAIAccountAffinityFromContext(requestCtx))),
 						zap.Int("upstream_status", failoverErr.StatusCode),
 						zap.Int("switch_count", switchCount),
 						zap.Int("max_switches", maxAccountSwitches),
@@ -901,6 +938,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 	var lastFailoverErr *service.UpstreamFailoverError
 	var oauth429FailoverState service.OpenAIOAuth429FailoverState
 	effectiveMappedModel := preferredMappedModel
+	requestCtx := service.WithOpenAIStickyAffinityScope(c.Request.Context())
 
 	for {
 		if failoverClientGone(c) {
@@ -912,7 +950,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 		}
 		reqLog.Debug("openai_messages.account_selecting", zap.Int("excluded_account_count", len(failedAccountIDs)))
 		selection, scheduleDecision, err := h.gatewayService.SelectAccountWithSchedulerForCapability(
-			c.Request.Context(),
+			requestCtx,
 			apiKey.GroupID,
 			"", // no previous_response_id
 			sessionHash,
@@ -961,12 +999,24 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 			return
 		}
 		account := selection.Account
+		requestCtx = lockOpenAIAccountAffinity(requestCtx, account)
 		sessionHash = ensureOpenAIPoolModeSessionHash(sessionHash, account)
+		reqLog.Info("openai_messages.account_affinity_locked",
+			zap.Int64("account_id", account.ID),
+			zap.String("account_type", account.Type),
+			zap.String("account_affinity", service.OpenAIAccountAffinityLogValue(service.OpenAIAccountAffinityForAccount(account))),
+			zap.String("locked_affinity", service.OpenAIAccountAffinityLogValue(service.OpenAIAccountAffinityFromContext(requestCtx))),
+			zap.Bool("sticky_affinity_scope", service.OpenAIStickyAffinityScopeEnabled(requestCtx)),
+			zap.String("schedule_layer", scheduleDecision.Layer),
+			zap.Bool("sticky_previous_hit", scheduleDecision.StickyPreviousHit),
+			zap.Bool("sticky_session_hit", scheduleDecision.StickySessionHit),
+			zap.Int("excluded_account_count", len(failedAccountIDs)),
+		)
 		reqLog.Debug("openai_messages.account_selected", zap.Int64("account_id", account.ID), zap.String("account_name", account.Name))
 		_ = scheduleDecision
 		setOpsSelectedAccount(c, account.ID, account.Platform)
 
-		accountReleaseFunc, acquired := h.acquireResponsesAccountSlot(c, apiKey.GroupID, sessionHash, selection, reqStream, &streamStarted, reqLog)
+		accountReleaseFunc, acquired := h.acquireResponsesAccountSlot(requestCtx, c, apiKey.GroupID, sessionHash, selection, reqStream, &streamStarted, reqLog)
 		if !acquired {
 			return
 		}
@@ -984,7 +1034,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 					accountReleaseFunc()
 				}
 			}()
-			return h.gatewayService.ForwardAsAnthropic(c.Request.Context(), c, account, forwardBody, promptCacheKey, defaultMappedModel)
+			return h.gatewayService.ForwardAsAnthropic(requestCtx, c, account, forwardBody, promptCacheKey, defaultMappedModel)
 		}()
 		cyberBlockKeyMsg := ""
 		if service.GetOpsCyberPolicy(c) != nil {
@@ -1060,8 +1110,12 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 						h.handleAnthropicFailoverExhausted(c, failoverErr, streamStarted)
 						return
 					}
+					requestCtx = maybeReleaseOpenAIAccountAffinityOnFailover(requestCtx, failoverErr)
 					reqLog.Warn("openai_messages.upstream_failover_switching",
 						zap.Int64("account_id", account.ID),
+						zap.String("account_type", account.Type),
+						zap.String("account_affinity", service.OpenAIAccountAffinityLogValue(service.OpenAIAccountAffinityForAccount(account))),
+						zap.String("locked_affinity", service.OpenAIAccountAffinityLogValue(service.OpenAIAccountAffinityFromContext(requestCtx))),
 						zap.Int("upstream_status", failoverErr.StatusCode),
 						zap.Int("switch_count", switchCount),
 						zap.Int("max_switches", maxAccountSwitches),
@@ -1255,6 +1309,7 @@ func (h *OpenAIGatewayHandler) acquireResponsesUserSlot(
 }
 
 func (h *OpenAIGatewayHandler) acquireResponsesAccountSlot(
+	ctx context.Context,
 	c *gin.Context,
 	groupID *int64,
 	sessionHash string,
@@ -1269,8 +1324,8 @@ func (h *OpenAIGatewayHandler) acquireResponsesAccountSlot(
 		return nil, false
 	}
 
-	ctx := c.Request.Context()
 	account := selection.Account
+	ctx = lockOpenAIAccountAffinity(ctx, account)
 	if selection.Acquired {
 		return wrapReleaseOnDone(ctx, selection.ReleaseFunc), true
 	}
@@ -1480,6 +1535,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	}
 
 	imageIntent := service.IsImageGenerationIntentForPlatform("/v1/responses", reqModel, firstMessage, openAICompatibleRequestPlatform(apiKey))
+	imageExecutionIntent := service.IsOpenAIResponsesImageGenerationExecutionIntent(reqModel, firstMessage)
 	if imageIntent && !service.GroupAllowsImageGeneration(apiKey.Group) {
 		closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, service.ImageGenerationPermissionMessage())
 		return
@@ -1567,6 +1623,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	switchCount := 0
 	failedAccountIDs := make(map[int64]struct{})
 	var lastFailoverErr *service.UpstreamFailoverError
+	selectionCtx := service.WithOpenAIStickyAffinityScope(ctx)
 	var oauth429FailoverState service.OpenAIOAuth429FailoverState
 	handleWSFailover := func(account *service.Account, failoverErr *service.UpstreamFailoverError) bool {
 		if ctx.Err() != nil {
@@ -1595,8 +1652,12 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			closeOpenAIWSFailoverExhausted(wsConn, failoverErr)
 			return false
 		}
+		selectionCtx = maybeReleaseOpenAIAccountAffinityOnFailover(selectionCtx, failoverErr)
 		reqLog.Warn("openai.websocket_upstream_failover_switching",
 			zap.Int64("account_id", account.ID),
+			zap.String("account_type", account.Type),
+			zap.String("account_affinity", service.OpenAIAccountAffinityLogValue(service.OpenAIAccountAffinityForAccount(account))),
+			zap.String("locked_affinity", service.OpenAIAccountAffinityLogValue(service.OpenAIAccountAffinityFromContext(selectionCtx))),
 			zap.Int("upstream_status", failoverErr.StatusCode),
 			zap.Int("switch_count", switchCount),
 			zap.Int("max_switches", maxAccountSwitches),
@@ -1613,6 +1674,10 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	if imageIntent && requestPlatform == service.PlatformOpenAI {
 		requiredCapability = service.OpenAIEndpointCapabilityResponses
 	}
+	if imageExecutionIntent && requestPlatform == service.PlatformOpenAI {
+		selectionCtx = service.WithOpenAIImageGenerationIntent(selectionCtx)
+		requiredCapability = service.OpenAIEndpointCapabilityResponsesImageGeneration
+	}
 
 	for {
 		if ctx.Err() != nil {
@@ -1620,7 +1685,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		}
 		reqLog.Debug("openai.websocket_account_selecting", zap.Int("excluded_account_count", len(failedAccountIDs)))
 		selection, scheduleDecision, err := h.gatewayService.SelectAccountWithSchedulerForCapability(
-			ctx,
+			selectionCtx,
 			apiKey.GroupID,
 			previousResponseID,
 			sessionHash,
@@ -1655,6 +1720,18 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		}
 
 		account := selection.Account
+		selectionCtx = lockOpenAIAccountAffinity(selectionCtx, account)
+		reqLog.Info("openai.websocket_account_affinity_locked",
+			zap.Int64("account_id", account.ID),
+			zap.String("account_type", account.Type),
+			zap.String("account_affinity", service.OpenAIAccountAffinityLogValue(service.OpenAIAccountAffinityForAccount(account))),
+			zap.String("locked_affinity", service.OpenAIAccountAffinityLogValue(service.OpenAIAccountAffinityFromContext(selectionCtx))),
+			zap.Bool("sticky_affinity_scope", service.OpenAIStickyAffinityScopeEnabled(selectionCtx)),
+			zap.String("schedule_layer", scheduleDecision.Layer),
+			zap.Bool("sticky_previous_hit", scheduleDecision.StickyPreviousHit),
+			zap.Bool("sticky_session_hit", scheduleDecision.StickySessionHit),
+			zap.Int("excluded_account_count", len(failedAccountIDs)),
+		)
 		accountMaxConcurrency := account.Concurrency
 		if selection.WaitPlan != nil && selection.WaitPlan.MaxConcurrency > 0 {
 			accountMaxConcurrency = selection.WaitPlan.MaxConcurrency
@@ -1682,7 +1759,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			accountReleaseFunc = fastReleaseFunc
 		}
 		currentAccountRelease = wrapReleaseOnDone(ctx, accountReleaseFunc)
-		if err := h.gatewayService.BindStickySession(ctx, apiKey.GroupID, sessionHash, account.ID); err != nil {
+		if err := h.gatewayService.BindStickySession(selectionCtx, apiKey.GroupID, sessionHash, account.ID); err != nil {
 			reqLog.Warn("openai.websocket_bind_sticky_session_failed", zap.Int64("account_id", account.ID), zap.Error(err))
 		}
 
@@ -1852,7 +1929,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		// WebSocket 首包可能很大，hash 必须在 hooks 外算成字符串，避免 AfterTurn 闭包保活请求体。
 		requestPayloadHash = service.HashUsageRequestPayload(wsFirstMessage)
 
-		if err := h.gatewayService.ProxyResponsesWebSocketFromClient(ctx, c, wsConn, account, token, wsFirstMessage, hooks); err != nil {
+		if err := h.gatewayService.ProxyResponsesWebSocketFromClient(selectionCtx, c, wsConn, account, token, wsFirstMessage, hooks); err != nil {
 			var failoverErr *service.UpstreamFailoverError
 			if errors.As(err, &failoverErr) {
 				if handleWSFailover(account, failoverErr) {
@@ -2397,6 +2474,24 @@ func setOpenAIClientTransportHTTP(c *gin.Context) {
 
 func setOpenAIClientTransportWS(c *gin.Context) {
 	service.SetOpenAIClientTransport(c, service.OpenAIClientTransportWS)
+}
+
+func lockOpenAIAccountAffinity(ctx context.Context, account *service.Account) context.Context {
+	if service.OpenAIAccountAffinityFromContext(ctx) != service.OpenAIAccountAffinityAny {
+		return ctx
+	}
+	affinity := service.OpenAIAccountAffinityForAccount(account)
+	if affinity == service.OpenAIAccountAffinityAny {
+		return ctx
+	}
+	return service.WithOpenAIAccountAffinity(ctx, affinity)
+}
+
+func maybeReleaseOpenAIAccountAffinityOnFailover(ctx context.Context, failoverErr *service.UpstreamFailoverError) context.Context {
+	if failoverErr == nil || !failoverErr.AllowCrossAffinity {
+		return ctx
+	}
+	return service.WithoutOpenAIAccountAffinity(ctx)
 }
 
 func ensureOpenAIPoolModeSessionHash(sessionHash string, account *service.Account) string {

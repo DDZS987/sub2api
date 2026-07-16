@@ -85,6 +85,11 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 		return
 	}
 	reqLog = reqLog.With(zap.String("model", reqModel), zap.Bool("stream", reqStream))
+	service.LogToolCallDebugOpenAIChat("handler.gateway.chat_completions", "inbound_request", body,
+		"user_id", subject.UserID,
+		"api_key_id", apiKey.ID,
+		"group_id", apiKey.GroupID,
+	)
 
 	setOpsRequestContext(c, reqModel, reqStream)
 	setOpsEndpointContext(c, "", int16(service.RequestTypeFromLegacy(reqStream, false)))

@@ -604,6 +604,18 @@ func (s *GeminiMessagesCompatService) Forward(ctx context.Context, c *gin.Contex
 		return nil, s.writeClaudeError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
 	}
 	geminiReq = ensureGeminiFunctionCallThoughtSignatures(geminiReq)
+	LogToolCallDebugAnthropic("service.gemini_messages_compat.forward", "inbound_claude_request", body,
+		"account_id", account.ID,
+		"account_type", account.Type,
+		"original_model", originalModel,
+		"mapped_model", mappedModel,
+	)
+	LogToolCallDebugGemini("service.gemini_messages_compat.forward", "converted_gemini_request", geminiReq,
+		"account_id", account.ID,
+		"account_type", account.Type,
+		"original_model", originalModel,
+		"mapped_model", mappedModel,
+	)
 	originalClaudeBody := body
 
 	proxyURL := ""
@@ -694,6 +706,11 @@ func (s *GeminiMessagesCompatService) Forward(ctx context.Context, c *gin.Contex
 				}
 				wrapped["request"] = inner
 				wrappedBytes, _ := json.Marshal(wrapped)
+				LogToolCallDebugGemini("service.gemini_messages_compat.forward", "upstream_wrapped_request", wrappedBytes,
+					"account_id", account.ID,
+					"account_type", account.Type,
+					"action", action,
+				)
 
 				upstreamReq, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, bytes.NewReader(wrappedBytes))
 				if err != nil {
@@ -1137,6 +1154,13 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
 	// Some Gemini upstreams validate tool call parts strictly; ensure any `functionCall` part includes a
 	// `thoughtSignature` to avoid frequent INVALID_ARGUMENT 400s.
 	body = ensureGeminiFunctionCallThoughtSignatures(body)
+	LogToolCallDebugGemini("service.gemini_messages_compat.forward_native", "normalized_inbound_request", body,
+		"account_id", account.ID,
+		"account_type", account.Type,
+		"original_model", originalModel,
+		"action", action,
+		"stream", stream,
+	)
 
 	mappedModel := originalModel
 	if account.Type == AccountTypeAPIKey || account.Type == AccountTypeServiceAccount {
@@ -1225,6 +1249,11 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
 				}
 				wrapped["request"] = inner
 				wrappedBytes, _ := json.Marshal(wrapped)
+				LogToolCallDebugGemini("service.gemini_messages_compat.forward_native", "upstream_wrapped_request", wrappedBytes,
+					"account_id", account.ID,
+					"account_type", account.Type,
+					"action", upstreamAction,
+				)
 
 				upstreamReq, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, bytes.NewReader(wrappedBytes))
 				if err != nil {
@@ -2041,6 +2070,9 @@ func (s *GeminiMessagesCompatService) handleStreamingResponse(c *gin.Context, re
 		if err := json.Unmarshal(unwrappedBytes, &geminiResp); err != nil {
 			continue
 		}
+		LogToolCallDebugGemini("service.gemini_messages_compat.forward", "upstream_stream_chunk", unwrappedBytes,
+			"original_model", originalModel,
+		)
 
 		if fr := extractGeminiFinishReason(geminiResp); fr != "" {
 			finishReason = fr
@@ -2207,6 +2239,13 @@ func (s *GeminiMessagesCompatService) handleStreamingResponse(c *gin.Context, re
 		})
 	}
 
+	// 检测空响应：如果 Google 返回成功但 candidates/parts 为空
+	// nextBlockIndex 表示创建的内容块数量，sawToolUse 表示是否有工具调用
+	if nextBlockIndex == 0 && !sawToolUse {
+		logger.LegacyPrintf("service.gemini_messages_compat", "[Gemini] Empty response detected: no content blocks generated (candidates or parts may be empty)")
+		return nil, fmt.Errorf("empty response from Gemini: no content generated (possible safety filter or model issue)")
+	}
+
 	stopReason := mapGeminiFinishReasonToClaudeStopReason(finishReason)
 	if sawToolUse {
 		stopReason = "tool_use"
@@ -2285,7 +2324,7 @@ func collectGeminiSSE(body io.Reader, isOAuth bool) (map[string]any, *ClaudeUsag
 
 	var last map[string]any
 	var lastWithParts map[string]any
-	var collectedTextParts []string // Collect all text parts for aggregation
+	var collectedParts []map[string]any
 	usage := &ClaudeUsage{}
 
 	for {
@@ -2297,7 +2336,7 @@ func collectGeminiSSE(body io.Reader, isOAuth bool) (map[string]any, *ClaudeUsag
 				switch payload {
 				case "", "[DONE]":
 					if payload == "[DONE]" {
-						return mergeCollectedTextParts(pickGeminiCollectResult(last, lastWithParts), collectedTextParts), usage, nil
+						return mergeCollectedGeminiParts(pickGeminiCollectResult(last, lastWithParts), collectedParts), usage, nil
 					}
 				default:
 					var parsed map[string]any
@@ -2313,16 +2352,20 @@ func collectGeminiSSE(body io.Reader, isOAuth bool) (map[string]any, *ClaudeUsag
 						_ = json.Unmarshal(rawBytes, &parsed)
 					}
 					if parsed != nil {
+						LogToolCallDebugGemini("service.gemini_messages_compat.collect_sse", "upstream_stream_chunk", rawBytes)
 						last = parsed
 						if u := extractGeminiUsage(rawBytes); u != nil {
 							usage = u
 						}
 						if parts := extractGeminiParts(parsed); len(parts) > 0 {
 							lastWithParts = parsed
-							// Collect text from each part for aggregation
 							for _, part := range parts {
 								if text, ok := part["text"].(string); ok && text != "" {
-									collectedTextParts = append(collectedTextParts, text)
+									collectedParts = append(collectedParts, map[string]any{"text": text})
+									continue
+								}
+								if len(part) > 0 {
+									collectedParts = append(collectedParts, cloneMapAny(part))
 								}
 							}
 						}
@@ -2339,7 +2382,7 @@ func collectGeminiSSE(body io.Reader, isOAuth bool) (map[string]any, *ClaudeUsag
 		}
 	}
 
-	return mergeCollectedTextParts(pickGeminiCollectResult(last, lastWithParts), collectedTextParts), usage, nil
+	return mergeCollectedGeminiParts(pickGeminiCollectResult(last, lastWithParts), collectedParts), usage, nil
 }
 
 func pickGeminiCollectResult(last map[string]any, lastWithParts map[string]any) map[string]any {
@@ -2352,16 +2395,13 @@ func pickGeminiCollectResult(last map[string]any, lastWithParts map[string]any) 
 	return map[string]any{}
 }
 
-// mergeCollectedTextParts merges all collected text chunks into the final response.
-// This fixes the issue where non-streaming responses only returned the last chunk
-// instead of the complete aggregated text.
-func mergeCollectedTextParts(response map[string]any, textParts []string) map[string]any {
-	if len(textParts) == 0 {
+// mergeCollectedGeminiParts merges all streamed Gemini parts into the final
+// response. Code Assist non-streaming requests are often served via upstream
+// streaming; keeping only the last chunk can drop earlier functionCall parts.
+func mergeCollectedGeminiParts(response map[string]any, collectedParts []map[string]any) map[string]any {
+	if len(collectedParts) == 0 {
 		return response
 	}
-
-	// Join all text parts
-	mergedText := strings.Join(textParts, "")
 
 	// Deep copy response
 	result := make(map[string]any)
@@ -2389,44 +2429,43 @@ func mergeCollectedTextParts(response map[string]any, textParts []string) map[st
 		candidate["content"] = content
 	}
 
-	// Get existing parts
-	existingParts, ok := content["parts"].([]any)
-	if !ok {
-		existingParts = []any{}
-	}
-
-	// Find and update first text part, or create new one
-	newParts := make([]any, 0, len(existingParts)+1)
-	textUpdated := false
-
-	for _, p := range existingParts {
-		pm, ok := p.(map[string]any)
-		if !ok {
-			newParts = append(newParts, p)
-			continue
-		}
-		if _, hasText := pm["text"]; hasText && !textUpdated {
-			// Replace with merged text
-			newPart := make(map[string]any)
-			for k, v := range pm {
-				newPart[k] = v
-			}
-			newPart["text"] = mergedText
-			newParts = append(newParts, newPart)
-			textUpdated = true
-		} else {
-			newParts = append(newParts, pm)
-		}
-	}
-
-	if !textUpdated {
-		newParts = append([]any{map[string]any{"text": mergedText}}, newParts...)
-	}
-
-	content["parts"] = newParts
+	content["parts"] = compactGeminiCollectedParts(collectedParts)
 	result["candidates"] = candidates
 
 	return result
+}
+
+func compactGeminiCollectedParts(parts []map[string]any) []any {
+	out := make([]any, 0, len(parts))
+	var pendingText strings.Builder
+	flushText := func() {
+		if pendingText.Len() == 0 {
+			return
+		}
+		out = append(out, map[string]any{"text": pendingText.String()})
+		pendingText.Reset()
+	}
+
+	for _, part := range parts {
+		if text, ok := part["text"].(string); ok {
+			if text != "" {
+				_, _ = pendingText.WriteString(text)
+			}
+			continue
+		}
+		flushText()
+		out = append(out, cloneMapAny(part))
+	}
+	flushText()
+	return out
+}
+
+func cloneMapAny(src map[string]any) map[string]any {
+	dst := make(map[string]any, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
 }
 
 type geminiNativeStreamResult struct {
@@ -2522,6 +2561,9 @@ func (s *GeminiMessagesCompatService) handleNativeNonStreamingResponse(c *gin.Co
 			respBody = unwrappedBody
 		}
 	}
+	LogToolCallDebugGemini("service.gemini_messages_compat.forward_native", "upstream_buffered_response", respBody,
+		"status", resp.StatusCode,
+	)
 
 	responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
 
@@ -2600,6 +2642,9 @@ func (s *GeminiMessagesCompatService) handleNativeStreamingResponse(c *gin.Conte
 					if u := extractGeminiUsage(rawBytes); u != nil {
 						usage = u
 					}
+					LogToolCallDebugGemini("service.gemini_messages_compat.forward_native", "upstream_stream_chunk", rawBytes,
+						"status", resp.StatusCode,
+					)
 
 					if firstTokenMs == nil {
 						ms := int(time.Since(startTime).Milliseconds())
@@ -2716,6 +2761,9 @@ func convertGeminiToClaudeMessage(geminiResp map[string]any, originalModel strin
 	if usage == nil {
 		usage = &ClaudeUsage{}
 	}
+	LogToolCallDebugGemini("service.gemini_messages_compat.forward", "upstream_gemini_response", rawData,
+		"original_model", originalModel,
+	)
 
 	contentBlocks := make([]any, 0)
 	sawToolUse := false
@@ -2759,6 +2807,18 @@ func convertGeminiToClaudeMessage(geminiResp map[string]any, originalModel strin
 		stopReason = "tool_use"
 	}
 
+	// 检测空响应：如果 contentBlocks 为空且不是工具调用
+	// 说明 Google 返回了成功但 candidates/parts 为空（可能是安全过滤或模型问题）
+	if len(contentBlocks) == 0 && !sawToolUse {
+		logger.LegacyPrintf("service.gemini_messages_compat", "[Gemini] Empty response detected (non-streaming): no content blocks (candidates or parts may be empty)")
+		// 注意：这里不能返回 error，因为已经在 HTTP handler 中
+		// 我们在 contentBlocks 中添加一个错误提示
+		contentBlocks = append(contentBlocks, map[string]any{
+			"type": "text",
+			"text": "[Error] Gemini returned empty response. This may be due to safety filters or model issues. Please try: 1) Using a different model (gemini-flash-1.5 or claude), 2) Modifying your prompt, or 3) Checking Google's safety settings.",
+		})
+	}
+
 	resp := map[string]any{
 		"id":            "msg_" + randomHex(12),
 		"type":          "message",
@@ -2771,6 +2831,11 @@ func convertGeminiToClaudeMessage(geminiResp map[string]any, originalModel strin
 			"input_tokens":  usage.InputTokens,
 			"output_tokens": usage.OutputTokens,
 		},
+	}
+	if debugBytes, err := json.Marshal(resp); err == nil {
+		LogToolCallDebugAnthropic("service.gemini_messages_compat.forward", "converted_claude_response", debugBytes,
+			"original_model", originalModel,
+		)
 	}
 
 	return resp, usage
@@ -2842,6 +2907,15 @@ func (s *GeminiMessagesCompatService) handleGeminiUpstreamError(ctx context.Cont
 	}
 
 	oauthType := account.GeminiOAuthType()
+
+	// google_one (Gemini CLI) 账号的 429 不冻结账号：实测显示 Google 侧限流窗口极短（RPM 级），
+	// 原有逻辑会将账号封至 PST 午夜（最长 24h），与实际情况严重不符。
+	// 临时跳过 SetRateLimited，让调度器继续使用该账号；真实限流会在下一次请求中由 Google 侧响应。
+	if oauthType == "google_one" {
+		log.Printf("[Gemini 429] Account %d (Gemini CLI / Google One) received 429, skipping freeze", account.ID)
+		return
+	}
+
 	tierID := account.GeminiTierID()
 	projectID := strings.TrimSpace(account.GetCredential("project_id"))
 	isCodeAssist := account.IsGeminiCodeAssist()

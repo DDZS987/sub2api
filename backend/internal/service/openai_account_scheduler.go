@@ -81,6 +81,7 @@ type OpenAIAccountScheduleRequest struct {
 	RequiredTransport       OpenAIUpstreamTransport
 	RequiredCapability      OpenAIEndpointCapability
 	RequiredImageCapability OpenAIImagesCapability
+	RequiredAffinity        OpenAIAccountAffinityDomain
 	RequireCompact          bool
 	ExcludedIDs             map[int64]struct{}
 }
@@ -392,7 +393,17 @@ func (s *defaultOpenAIAccountScheduler) Select(
 			return nil, decision, err
 		}
 		if selection != nil && selection.Account != nil {
-			if !s.isAccountTransportCompatible(selection.Account, req.RequiredTransport) {
+			if !s.isAccountTransportCompatible(selection.Account, req.RequiredTransport) ||
+				!OpenAIAccountMatchesAffinity(selection.Account, req.RequiredAffinity) {
+				if !OpenAIAccountMatchesAffinity(selection.Account, req.RequiredAffinity) {
+					slog.Info("openai.previous_response_affinity_skipped",
+						"account_id", selection.Account.ID,
+						"account_type", selection.Account.Type,
+						"account_affinity", OpenAIAccountAffinityLogValue(OpenAIAccountAffinityForAccount(selection.Account)),
+						"required_affinity", OpenAIAccountAffinityLogValue(req.RequiredAffinity),
+						"session_hash_present", strings.TrimSpace(req.SessionHash) != "",
+					)
+				}
 				if selection.ReleaseFunc != nil {
 					selection.ReleaseFunc()
 				}
@@ -405,7 +416,8 @@ func (s *defaultOpenAIAccountScheduler) Select(
 			decision.SelectedAccountID = selection.Account.ID
 			decision.SelectedAccountType = selection.Account.Type
 			if req.SessionHash != "" {
-				_ = s.service.BindStickySession(ctx, req.GroupID, req.SessionHash, selection.Account.ID)
+				bindCtx := withOpenAIAccountAffinityForAccount(ctx, selection.Account)
+				_ = s.service.BindStickySession(bindCtx, req.GroupID, req.SessionHash, selection.Account.ID)
 			}
 			return selection, decision, nil
 		}
@@ -486,6 +498,16 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 		_ = s.service.deleteStickySessionAccountID(ctx, req.GroupID, sessionHash)
 		return nil, false, nil
 	}
+	if !OpenAIAccountMatchesAffinity(account, req.RequiredAffinity) {
+		slog.Info("openai.sticky_affinity_skipped",
+			"account_id", account.ID,
+			"account_type", account.Type,
+			"account_affinity", OpenAIAccountAffinityLogValue(OpenAIAccountAffinityForAccount(account)),
+			"required_affinity", OpenAIAccountAffinityLogValue(req.RequiredAffinity),
+			"session_hash", sessionHash,
+		)
+		return nil, false, nil
+	}
 	if !s.isAccountRequestCompatible(ctx, account, req) {
 		return nil, false, nil
 	}
@@ -510,7 +532,8 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 	}
 	result, acquireErr := s.service.tryAcquireAccountSlot(ctx, accountID, account.Concurrency)
 	if acquireErr == nil && result != nil && result.Acquired {
-		_ = s.service.refreshStickySessionTTL(ctx, req.GroupID, sessionHash, s.service.openAIWSSessionStickyTTL())
+		refreshCtx := withOpenAIAccountAffinityForAccount(ctx, account)
+		_ = s.service.refreshStickySessionTTL(refreshCtx, req.GroupID, sessionHash, s.service.openAIWSSessionStickyTTL())
 		return &AccountSelectionResult{
 			Account:     account,
 			Acquired:    true,
@@ -1152,7 +1175,6 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 			release(result)
 			continue
 		}
-
 		if fresh.Concurrency != candidate.account.Concurrency {
 			release(result)
 			result, attempted, acquireErr = s.tryAcquireOpenAIAccountSlot(ctx, fresh.ID, fresh.Concurrency, budget)
@@ -1167,7 +1189,8 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 			}
 		}
 		if req.SessionHash != "" && !req.PreserveStickyBinding {
-			_ = s.service.BindStickySession(ctx, req.GroupID, req.SessionHash, fresh.ID)
+			bindCtx := withOpenAIAccountAffinityForAccount(ctx, fresh)
+			_ = s.service.BindStickySession(bindCtx, req.GroupID, req.SessionHash, fresh.ID)
 		}
 		return &AccountSelectionResult{
 			Account:     fresh,
@@ -1608,6 +1631,9 @@ func (s *defaultOpenAIAccountScheduler) isAccountRequestCompatible(ctx context.C
 		return false
 	}
 	if s != nil && s.service != nil && s.service.isOpenAIAccountRequestRuntimeBlocked(account, req.RequestedModel) {
+		return false
+	}
+	if !OpenAIAccountMatchesAffinity(account, req.RequiredAffinity) {
 		return false
 	}
 	// Quota auto-pause must be evaluated during the initial filter too. Without it the
@@ -2065,6 +2091,7 @@ func (s *OpenAIGatewayService) selectAccountWithScheduler(
 		RequiredTransport:       requiredTransport,
 		RequiredCapability:      requiredCapability,
 		RequiredImageCapability: requiredImageCapability,
+		RequiredAffinity:        OpenAIAccountAffinityFromContext(ctx),
 		RequireCompact:          requireCompact,
 		ExcludedIDs:             excludedIDs,
 	})

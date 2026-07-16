@@ -87,7 +87,7 @@ const codexImageGenerationFunctionToolName = "image_gen.imagegen"
 
 const (
 	codexImageGenerationBridgeMarker = "<sub2api-codex-image-generation>"
-	codexImageGenerationBridgeText   = codexImageGenerationBridgeMarker + "\nWhen the user asks for raster image generation or editing, use the OpenAI Responses native `image_generation` tool attached to this request. The local Codex client may not expose an `image_gen` namespace, but that does not mean image generation is unavailable. Do not ask the user to switch to CLI fallback solely because `image_gen` is absent.\n</sub2api-codex-image-generation>"
+	codexImageGenerationBridgeText   = codexImageGenerationBridgeMarker + "\nWhen the user asks for raster image generation or editing, use the OpenAI Responses native `image_generation` tool attached to this request. Call that tool before claiming the image is complete. Reading local imagegen skill documentation or describing a supposed image without an `image_generation` result does not satisfy the request. The local Codex client may not expose an `image_gen` namespace, but that does not mean image generation is unavailable. Do not ask the user to switch to CLI fallback solely because `image_gen` is absent.\n</sub2api-codex-image-generation>"
 	codexSparkImageUnsupportedMarker = "<sub2api-codex-spark-image-unsupported>"
 	codexSparkImageUnsupportedText   = codexSparkImageUnsupportedMarker + "\nThe current model is gpt-5.3-codex-spark, which does not support image generation, image editing, image input, the `image_generation` tool, or Codex `image_gen`/`$imagegen` workflows. If the user asks for image generation or image editing, clearly explain this model limitation and ask them to switch to a non-Spark Codex model such as gpt-5.3-codex or gpt-5.4. Do not claim that the local environment merely lacks image_gen tooling, and do not suggest CLI fallback as the primary fix while the model remains Spark.\n</sub2api-codex-spark-image-unsupported>"
 )
@@ -774,6 +774,43 @@ func stripOpenAIImageGenerationToolsFromRawPayload(payload []byte) ([]byte, bool
 	return rebuilt, true, nil
 }
 
+// applyCodexImageGenerationBridgeToRawPayload adds the native Responses image
+// tool to request paths that otherwise preserve the client payload verbatim.
+// Callers are responsible for applying the Codex, group-permission, compact,
+// and account/channel/global policy gates before invoking this helper.
+func applyCodexImageGenerationBridgeToRawPayload(payload []byte, forceImageGeneration bool) ([]byte, bool, error) {
+	payloadMap := make(map[string]any)
+	if err := json.Unmarshal(payload, &payloadMap); err != nil {
+		return payload, false, err
+	}
+
+	modified := false
+	if ensureOpenAIResponsesImageGenerationTool(payloadMap) {
+		modified = true
+	}
+	if ensureOpenAIResponsesImageGenerationToolChoiceAuto(payloadMap) {
+		modified = true
+	}
+	if forceImageGeneration && forceOpenAIResponsesImageGenerationToolChoice(payloadMap) {
+		modified = true
+	}
+	if normalizeOpenAIResponsesImageGenerationTools(payloadMap) {
+		modified = true
+	}
+	if applyCodexImageGenerationBridgeInstructions(payloadMap) {
+		modified = true
+	}
+	if !modified {
+		return payload, false, nil
+	}
+
+	rebuilt, err := json.Marshal(payloadMap)
+	if err != nil {
+		return payload, false, err
+	}
+	return rebuilt, true, nil
+}
+
 // stripCodexSparkImageGenerationTools removes image tool declarations and choices.
 // gpt-5.3-codex-spark rejects those capabilities upstream, while Codex clients may
 // advertise them by default.
@@ -901,6 +938,53 @@ func ensureOpenAIResponsesImageGenerationToolChoiceAuto(reqBody map[string]any) 
 	}
 	reqBody["tool_choice"] = "auto"
 	return true
+}
+
+// forceOpenAIResponsesImageGenerationToolChoice upgrades an automatic or
+// image_gen namespace choice to the native Responses image tool. Callers must
+// first establish explicit user intent; unrelated requests must remain auto.
+func forceOpenAIResponsesImageGenerationToolChoice(reqBody map[string]any) bool {
+	if len(reqBody) == 0 || !hasNativeOpenAIImageGenerationTool(reqBody) {
+		return false
+	}
+	choice, exists := reqBody["tool_choice"]
+	if exists {
+		switch value := choice.(type) {
+		case string:
+			if strings.TrimSpace(value) != "auto" {
+				return false
+			}
+		case map[string]any:
+			choiceType := strings.TrimSpace(firstNonEmptyString(value["type"]))
+			if choiceType == "image_generation" {
+				return false
+			}
+			if !openAIAnyToolChoiceSelectsImageGeneration(value) {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	reqBody["tool_choice"] = map[string]any{"type": "image_generation"}
+	return true
+}
+
+func hasNativeOpenAIImageGenerationTool(reqBody map[string]any) bool {
+	if reqBody == nil {
+		return false
+	}
+	tools, ok := reqBody["tools"].([]any)
+	if !ok {
+		return false
+	}
+	for _, rawTool := range tools {
+		tool, ok := rawTool.(map[string]any)
+		if ok && isOpenAIImageGenerationType(firstNonEmptyString(tool["type"])) {
+			return true
+		}
+	}
+	return false
 }
 
 func applyCodexImageGenerationBridgeInstructions(reqBody map[string]any) bool {

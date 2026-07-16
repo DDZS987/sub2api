@@ -43,6 +43,11 @@ func (s *GatewayService) ForwardAsChatCompletions(
 	originalModel := ccReq.Model
 	clientStream := ccReq.Stream
 	includeUsage := ccReq.StreamOptions != nil && ccReq.StreamOptions.IncludeUsage
+	LogToolCallDebugOpenAIChat("service.gateway.forward_as_chat_completions", "parsed_openai_request", body,
+		"account_id", account.ID,
+		"account_platform", account.Platform,
+		"account_type", account.Type,
+	)
 
 	// 2. Convert CC → Responses → Anthropic (chained conversion)
 	responsesReq, err := apicompat.ChatCompletionsToResponses(&ccReq)
@@ -89,6 +94,11 @@ func (s *GatewayService) ForwardAsChatCompletions(
 	if err != nil {
 		return nil, fmt.Errorf("marshal anthropic request: %w", err)
 	}
+	LogToolCallDebugAnthropic("service.gateway.forward_as_chat_completions", "converted_anthropic_request", anthropicBody,
+		"account_id", account.ID,
+		"original_model", originalModel,
+		"mapped_model", mappedModel,
+	)
 
 	// 6. Apply Claude Code mimicry for OAuth accounts.
 	// Chat Completions 协议进来的请求永远不是 Claude Code 客户端，所以对 OAuth 账号
@@ -318,6 +328,16 @@ func (s *GatewayService) handleCCBufferedFromAnthropic(
 	// Chain: Anthropic → Responses → Chat Completions
 	responsesResp := apicompat.AnthropicToResponsesResponse(finalResp)
 	ccResp := apicompat.ResponsesToChatCompletions(responsesResp, originalModel)
+	if debugBytes, err := json.Marshal(finalResp); err == nil {
+		LogToolCallDebugAnthropic("service.gateway.forward_as_chat_completions", "buffered_anthropic_final", debugBytes,
+			"request_id", requestID,
+		)
+	}
+	if debugBytes, err := json.Marshal(ccResp); err == nil {
+		LogToolCallDebugOpenAIChat("service.gateway.forward_as_chat_completions", "buffered_openai_response", debugBytes,
+			"request_id", requestID,
+		)
+	}
 
 	if s.responseHeaderFilter != nil {
 		responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
@@ -405,6 +425,11 @@ func (s *GatewayService) handleCCStreamingFromAnthropic(
 		sse, err := apicompat.ChatChunkToSSE(chunk)
 		if err != nil {
 			return false
+		}
+		if debugBytes, err := json.Marshal(chunk); err == nil {
+			LogToolCallDebugOpenAIChat("service.gateway.forward_as_chat_completions", "stream_openai_chunk", debugBytes,
+				"request_id", requestID,
+			)
 		}
 		// Reverse tool name mapping: fake → real, per-chunk bytes.Replace.
 		// c 可能持有请求侧注入的 ToolNameRewrite；无则仅做静态前缀还原。

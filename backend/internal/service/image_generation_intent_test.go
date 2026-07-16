@@ -178,6 +178,42 @@ func TestIsImageGenerationIntentJSONSemantics(t *testing.T) {
 	}
 }
 
+func TestIsExplicitCodexImageGenerationUserRequest(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{name: "Chinese direct generation", body: `{"input":"请生成一张写实摄影风格的北极极光雪景"}`, want: true},
+		{name: "Chinese direct drawing in long input", body: `{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"以前的上下文"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"好的"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"帮我画一张橘猫图片"}]}]}`, want: true},
+		{name: "English direct generation", body: `{"input":"Create an image of a blue circle on a dark background"}`, want: true},
+		{name: "Image edit", body: `{"input":"把这张图片改成水彩风格"}`, want: true},
+		{name: "Code discussion", body: `{"input":"请帮我修复生成图片的代码"}`, want: false},
+		{name: "API discussion", body: `{"input":"研究一下图片生成接口为什么失败"}`, want: false},
+		{name: "English code discussion", body: `{"input":"Write code to generate an image with the API"}`, want: false},
+		{name: "English draw code", body: `{"input":"Write code to draw a rectangle on an HTML canvas"}`, want: false},
+		{name: "English idiom", body: `{"input":"Draw a conclusion from these logs"}`, want: false},
+		{name: "Chinese drawing code", body: `{"input":"请用代码画一张折线图"}`, want: false},
+		{name: "Explicit negative", body: `{"input":"不要生成图片，只分析这段代码"}`, want: false},
+		{name: "Ordinary coding request", body: `{"input":"修复登录页面的按钮"}`, want: false},
+		{name: "Tool result is not a new user request", body: `{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"请画一只猫"}]},{"type":"function_call_output","call_id":"call_1","output":"skill docs"}]}`, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, isExplicitCodexImageGenerationUserRequest([]byte(tt.body)))
+		})
+	}
+}
+
+func TestIsOpenAIResponsesImageGenerationExecutionIntent(t *testing.T) {
+	require.True(t, IsOpenAIResponsesImageGenerationExecutionIntent("gpt-5.6-sol", []byte(`{"input":"请生成一张蓝色圆形图片","tool_choice":"auto"}`)))
+	require.True(t, IsOpenAIResponsesImageGenerationExecutionIntent("gpt-5.6-sol", []byte(`{"input":"普通文字","tool_choice":{"type":"image_generation"}}`)))
+	require.True(t, IsOpenAIResponsesImageGenerationExecutionIntent("gpt-image-2", []byte(`{"input":"蓝色圆形"}`)))
+	require.False(t, IsOpenAIResponsesImageGenerationExecutionIntent("gpt-5.6-sol", []byte(`{"input":"解释这段代码","tools":[{"type":"image_generation"}],"tool_choice":"auto"}`)))
+	require.False(t, IsOpenAIResponsesImageGenerationExecutionIntent("gpt-5.6-sol", []byte(`{"input":"研究图片生成接口为什么失败","tools":[{"type":"namespace","name":"image_gen"}]}`)))
+}
+
 func TestIsImageGenerationIntentMap_NamespaceImageGen(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -262,6 +298,20 @@ func TestIsImageGenerationIntentMap_NamespaceImageGen(t *testing.T) {
 			require.Equal(t, tt.want, IsImageGenerationIntentMap("/v1/responses", "gpt-5.5", tt.reqBody))
 		})
 	}
+}
+
+func TestOpenAIRequestBodyHasCodexImageGenNamespace(t *testing.T) {
+	require.True(t, openAIRequestBodyHasCodexImageGenNamespace([]byte(`{
+		"tools":[{"type":"namespace","name":"image_gen","tools":[{"type":"function","name":"imagegen"}]}]
+	}`)))
+	require.True(t, openAIRequestBodyHasCodexImageGenNamespace([]byte(`{
+		"input":[{"type":"additional_tools","tools":[{"type":"namespace","name":"image_gen"}]}]
+	}`)))
+	require.False(t, openAIRequestBodyHasCodexImageGenNamespace([]byte(`{
+		"tools":[{"type":"image_generation","model":"gpt-image-2"}]
+	}`)))
+	require.False(t, openAIRequestBodyHasCodexImageGenNamespace([]byte(`{"tools":[]}`)))
+	require.False(t, openAIRequestBodyHasCodexImageGenNamespace([]byte(`not-json`)))
 }
 
 func TestResolveOpenAIResponsesImageBillingConfigUsesCurrentBodyModel(t *testing.T) {

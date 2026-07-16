@@ -83,9 +83,13 @@ temp/
 *.temp
 *.log
 *.bak
+*.bak-*
 .cache/
 .dev/
 .serena/
+
+# 本机生产数据库备份，禁止进入 Git
+backups/
 
 # ===================
 # 构建产物
@@ -136,6 +140,7 @@ docs/*
 !docs/PAYMENT_CN.md
 !docs/ADMIN_PAYMENT_INTEGRATION_API.md
 !docs/ASYNC_IMAGE_TASKS.md
+!docs/IMAGE2_API_CN.md
 !docs/legal/
 !docs/legal/*.md
 .serena/

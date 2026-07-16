@@ -22,6 +22,11 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	startTime := time.Now()
 	// 固定渠道映射后的请求级 canonical body；账号 normalize/strip 不得改写跨 failover hint。
 	canonicalImageIntentBody := body
+	if c != nil {
+		// Forward can be retried with another account. Never let a bridge marker
+		// from an earlier failed attempt leak into the response scope of the next.
+		c.Set(codexImageBridgeAppliedContextKey, false)
+	}
 
 	restrictionResult := s.detectCodexClientRestriction(c, account, body)
 	apiKeyID := getAPIKeyIDFromContext(c)
@@ -93,6 +98,25 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	if isCodexCLI {
 		codexImageGenerationExplicitToolPolicy = account.CodexImageGenerationExplicitToolPolicy()
 	}
+	apiKey := getAPIKeyFromContext(c)
+	imageGenerationAllowed := GroupAllowsImageGeneration(nil)
+	if apiKey != nil {
+		imageGenerationAllowed = GroupAllowsImageGeneration(apiKey.Group)
+	}
+	codexImageGenerationBridgeEnabled := s.ShouldInjectCodexImageGenerationBridge(ctx, c, account, body)
+	forceCodexImageGeneration := codexImageGenerationBridgeEnabled &&
+		codexImageGenerationExplicitToolPolicy != codexImageGenerationExplicitToolPolicyStrip &&
+		isExplicitCodexImageGenerationUserRequest(body)
+	codexImageGenerationBridgeApplied := false
+	isCompactRequest := isOpenAIResponsesCompactPath(c)
+	clientTransport := GetOpenAIClientTransport(c)
+	// 原始请求没有图片工具时，handler 无法在选号前判定账号级注入策略。
+	// 在此处已确认会注入后再申请图片并发名额，且必须在任何上游请求之前完成。
+	if clientTransport == OpenAIClientTransportHTTP && codexImageGenerationBridgeEnabled {
+		if !acquireOpenAIImageGenerationSlotIfBound(c) {
+			return nil, errors.New("image generation concurrency slot unavailable")
+		}
+	}
 	if c != nil {
 		c.Set("openai_ws_transport_decision", string(wsDecision.Transport))
 		c.Set("openai_ws_transport_reason", wsDecision.Reason)
@@ -134,6 +158,20 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 				attemptImageIntentInvalidated = true
 				logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Stripped /responses image_generation tool for Codex client by account policy")
 			}
+		} else if codexImageGenerationBridgeEnabled {
+			bridgedBody, changed, bridgeErr := applyCodexImageGenerationBridgeToRawPayload(body, forceCodexImageGeneration)
+			if bridgeErr != nil {
+				return nil, bridgeErr
+			}
+			if changed {
+				body = bridgedBody
+				originalBody = bridgedBody
+				logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Injected /responses image_generation bridge for Codex passthrough client")
+			}
+			codexImageGenerationBridgeApplied = openAIRequestBodyHasNativeImageGenerationTool(body)
+		}
+		if codexImageGenerationBridgeApplied {
+			markCodexImageGenerationBridgeApplied(c)
 		}
 		// 透传分支只需要轻量提取字段，避免热路径全量 Unmarshal。
 		mappedModel := account.GetMappedModel(reqModel)
@@ -204,17 +242,6 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		bodyModified = true
 		disablePatch()
 	}
-
-	apiKey := getAPIKeyFromContext(c)
-	imageGenerationAllowed := GroupAllowsImageGeneration(nil)
-	if apiKey != nil {
-		imageGenerationAllowed = GroupAllowsImageGeneration(apiKey.Group)
-	}
-	codexImageGenerationBridgeEnabled := isCodexCLI &&
-		!isOpenAIResponsesLiteHeader(c.GetHeader(responsesLiteHeader)) &&
-		imageGenerationAllowed &&
-		codexImageGenerationExplicitToolPolicy != codexImageGenerationExplicitToolPolicyStrip &&
-		s.isCodexImageGenerationBridgeEnabled(ctx, account, apiKey)
 	var imageIntent bool
 	canonicalImageIntent := resolveOpenAIImageIntentHint(c, reqModel, canonicalImageIntentBody, IsImageGenerationIntent)
 	if isCodexCLI && codexImageGenerationExplicitToolPolicy == codexImageGenerationExplicitToolPolicyStrip {
@@ -249,7 +276,6 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		markPatchSet("model", billingModel)
 	}
 	upstreamModel := billingModel
-	isCompactRequest := isOpenAIResponsesCompactPath(c)
 	compactMapped := false
 	if isCompactRequest {
 		compactMappedModel := resolveOpenAICompactForwardModel(account, billingModel)
@@ -293,12 +319,17 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			return nil, decodeErr
 		}
 		if codexImageGenerationBridgeEnabled && ensureOpenAIResponsesImageGenerationTool(decoded) {
+			codexImageGenerationBridgeApplied = true
 			markDecodedModified()
 			logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Injected /responses image_generation tool for Codex client")
 		}
 		if codexImageGenerationBridgeEnabled && ensureOpenAIResponsesImageGenerationToolChoiceAuto(decoded) {
 			markDecodedModified()
 			logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Set /responses image_generation tool_choice=auto for Codex client")
+		}
+		if forceCodexImageGeneration && forceOpenAIResponsesImageGenerationToolChoice(decoded) {
+			markDecodedModified()
+			logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Forced /responses image_generation tool_choice for explicit Codex image request")
 		}
 		if normalizeOpenAIResponsesImageGenerationTools(decoded) {
 			markDecodedModified()
@@ -491,6 +522,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			requestView = newOpenAIRequestView(body)
 		}
 	}
+	if codexImageGenerationBridgeEnabled && clientTransport == OpenAIClientTransportHTTP && openAIRequestBodyHasNativeImageGenerationTool(body) {
+		markCodexImageGenerationBridgeApplied(c)
+	}
 	imageBillingModel := ""
 	imageSizeTier := ""
 	imageInputSize := ""
@@ -578,12 +612,17 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			if wsInvalidEncryptedContentRecoveryTried {
 				return false
 			}
-			removedReasoningItems := trimOpenAIEncryptedReasoningItems(wsReqBody)
-			if !removedReasoningItems {
+			encryptedContentFields := countOpenAIEncryptedContentFields(wsReqBody)
+			removedEncryptedContent := trimOpenAIEncryptedReasoningItems(wsReqBody)
+			if trimOpenAIEncryptedContentFields(wsReqBody) {
+				removedEncryptedContent = true
+			}
+			if !removedEncryptedContent {
 				logOpenAIWSModeInfo(
-					"reconnect_invalid_encrypted_content_recovery_skip account_id=%d attempt=%d reason=missing_encrypted_reasoning_items",
+					"reconnect_invalid_encrypted_content_recovery_skip account_id=%d attempt=%d reason=missing_encrypted_content_fields encrypted_content_fields=%d",
 					account.ID,
 					attempt,
+					encryptedContentFields,
 				)
 				return false
 			}
@@ -594,9 +633,10 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			}
 			wsInvalidEncryptedContentRecoveryTried = true
 			logOpenAIWSModeInfo(
-				"reconnect_invalid_encrypted_content_recovery account_id=%d attempt=%d action=drop_encrypted_reasoning_items retry=1 previous_response_id_present=%v previous_response_id=%s previous_response_id_kind=%s has_function_call_output=%v dropped_previous_response_id=%v",
+				"reconnect_invalid_encrypted_content_recovery account_id=%d attempt=%d action=drop_encrypted_content_fields retry=1 encrypted_content_fields=%d previous_response_id_present=%v previous_response_id=%s previous_response_id_kind=%s has_function_call_output=%v dropped_previous_response_id=%v",
 				account.ID,
 				attempt,
+				encryptedContentFields,
 				previousResponseID != "",
 				truncateOpenAIWSLogValue(previousResponseID, openAIWSIDValueMaxLen),
 				normalizeOpenAIWSLogValue(ClassifyOpenAIPreviousResponseIDKind(previousResponseID)),
@@ -836,17 +876,22 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 				if decodeErr != nil {
 					return nil, decodeErr
 				}
-				if trimOpenAIEncryptedReasoningItems(decoded) {
+				encryptedContentFields := countOpenAIEncryptedContentFields(decoded)
+				removedEncryptedContent := trimOpenAIEncryptedReasoningItems(decoded)
+				if trimOpenAIEncryptedContentFields(decoded) {
+					removedEncryptedContent = true
+				}
+				if removedEncryptedContent {
 					body, err = marshalOpenAIUpstreamJSON(decoded)
 					if err != nil {
 						return nil, fmt.Errorf("serialize invalid_encrypted_content retry body: %w", err)
 					}
 					httpInvalidEncryptedContentRetryTried = true
 					rejectedFieldRetryState.remember(body)
-					logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Retrying non-WSv2 request once after invalid_encrypted_content (account: %s)", account.Name)
+					logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Retrying non-WSv2 request once after invalid_encrypted_content (account: %s, encrypted_content_fields: %d)", account.Name, encryptedContentFields)
 					continue
 				}
-				logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Skip non-WSv2 invalid_encrypted_content retry because encrypted reasoning items are missing (account: %s)", account.Name)
+				logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Skip non-WSv2 invalid_encrypted_content retry because encrypted_content fields are missing (account: %s, encrypted_content_fields: %d)", account.Name, encryptedContentFields)
 			}
 			if retryBody, reason, changed, retryErr := normalizeOpenAIResponsesRejectedFieldRetryBody(resp.StatusCode, body, respBody); retryErr != nil {
 				return nil, fmt.Errorf("normalize rejected Responses field retry body: %w", retryErr)

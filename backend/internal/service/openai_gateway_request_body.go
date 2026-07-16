@@ -125,6 +125,55 @@ func trimOpenAIEncryptedReasoningItems(reqBody map[string]any) bool {
 	}
 }
 
+func trimOpenAIEncryptedContentFields(value any) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		changed := false
+		if _, ok := typed["encrypted_content"]; ok {
+			delete(typed, "encrypted_content")
+			changed = true
+		}
+		for _, child := range typed {
+			if trimOpenAIEncryptedContentFields(child) {
+				changed = true
+			}
+		}
+		return changed
+	case []any:
+		changed := false
+		for _, child := range typed {
+			if trimOpenAIEncryptedContentFields(child) {
+				changed = true
+			}
+		}
+		return changed
+	default:
+		return false
+	}
+}
+
+func countOpenAIEncryptedContentFields(value any) int {
+	switch typed := value.(type) {
+	case map[string]any:
+		count := 0
+		if _, ok := typed["encrypted_content"]; ok {
+			count++
+		}
+		for _, child := range typed {
+			count += countOpenAIEncryptedContentFields(child)
+		}
+		return count
+	case []any:
+		count := 0
+		for _, child := range typed {
+			count += countOpenAIEncryptedContentFields(child)
+		}
+		return count
+	default:
+		return 0
+	}
+}
+
 func sanitizeEncryptedReasoningInputItem(item any) (next any, changed bool, keep bool) {
 	inputItem, ok := item.(map[string]any)
 	if !ok {

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -16,7 +17,8 @@ import (
 type gatewayModelsAccountRepoStub struct {
 	service.AccountRepository
 
-	byGroup map[int64][]service.Account
+	byGroup        map[int64][]service.Account
+	catalogByGroup map[int64][]service.Account
 }
 
 type gatewayModelsResponseForTest struct {
@@ -48,6 +50,24 @@ func (s *gatewayModelsAccountRepoStub) ListSchedulableByGroupID(ctx context.Cont
 	}
 	out := make([]service.Account, len(accounts))
 	copy(out, accounts)
+	return out, nil
+}
+
+func (s *gatewayModelsAccountRepoStub) ListByGroup(ctx context.Context, groupID int64) ([]service.Account, error) {
+	accounts, ok := s.catalogByGroup[groupID]
+	if !ok {
+		accounts, ok = s.byGroup[groupID]
+	}
+	if !ok {
+		return nil, nil
+	}
+	out := make([]service.Account, len(accounts))
+	copy(out, accounts)
+	if _, hasExplicitCatalog := s.catalogByGroup[groupID]; !hasExplicitCatalog {
+		for i := range out {
+			out[i].Schedulable = true
+		}
+	}
 	return out, nil
 }
 
@@ -228,6 +248,180 @@ func TestGatewayModels_CustomModelsListDisabledKeepsOriginalModels(t *testing.T)
 	var got gatewayModelsResponseForTest
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
 	require.Equal(t, []string{"gpt-5.4", "gpt-5.5"}, modelIDsForTest(got.Data))
+}
+
+func TestGatewayModels_OpenAIUnmappedAccountMergesDefaultModelsWithMappedAccounts(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	groupID := int64(31)
+	h := newGatewayModelsHandlerForTest(
+		&gatewayModelsAccountRepoStub{
+			byGroup: map[int64][]service.Account{
+				groupID: {
+					{
+						ID:       1,
+						Platform: service.PlatformOpenAI,
+						Credentials: map[string]any{
+							"model_mapping": map[string]any{
+								"legacy-gpt-2024": "legacy-gpt-2024",
+							},
+						},
+					},
+					{
+						ID:       2,
+						Platform: service.PlatformOpenAI,
+					},
+				},
+			},
+		},
+	)
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	c.Set(string(middleware2.ContextKeyAPIKey), &service.APIKey{
+		Group: &service.Group{ID: groupID, Platform: service.PlatformOpenAI},
+	})
+
+	h.Models(c)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var got gatewayModelsResponseForTest
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	ids := modelIDsForTest(got.Data)
+	require.Contains(t, ids, "legacy-gpt-2024")
+	require.Contains(t, ids, "gpt-5.6-sol")
+	require.Contains(t, ids, "gpt-5.6-terra")
+	require.Contains(t, ids, "gpt-5.6-luna")
+}
+
+func TestGatewayModels_OpenAIRateLimitedUnmappedAccountStillContributesDefaultModels(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	groupID := int64(32)
+	rateLimitResetAt := time.Now().Add(time.Hour)
+	mappedAccount := service.Account{
+		ID:          1,
+		Platform:    service.PlatformOpenAI,
+		Status:      service.StatusActive,
+		Schedulable: true,
+		Credentials: map[string]any{
+			"model_mapping": map[string]any{
+				"gpt-5.5": "gpt-5.5",
+			},
+		},
+	}
+	unmappedRateLimitedAccount := service.Account{
+		ID:               2,
+		Platform:         service.PlatformOpenAI,
+		Status:           service.StatusActive,
+		Schedulable:      true,
+		RateLimitResetAt: &rateLimitResetAt,
+	}
+	h := newGatewayModelsHandlerForTest(
+		&gatewayModelsAccountRepoStub{
+			byGroup: map[int64][]service.Account{
+				groupID: {mappedAccount},
+			},
+			catalogByGroup: map[int64][]service.Account{
+				groupID: {mappedAccount, unmappedRateLimitedAccount},
+			},
+		},
+	)
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	c.Set(string(middleware2.ContextKeyAPIKey), &service.APIKey{
+		Group: &service.Group{ID: groupID, Platform: service.PlatformOpenAI},
+	})
+
+	h.Models(c)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var got gatewayModelsResponseForTest
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	ids := modelIDsForTest(got.Data)
+	require.Contains(t, ids, "gpt-5.6-sol")
+	require.Contains(t, ids, "gpt-5.6-terra")
+	require.Contains(t, ids, "gpt-5.6-luna")
+}
+
+func TestGatewayModels_OpenAIStableUnavailableUnmappedAccountsDoNotContributeDefaults(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	now := time.Now()
+	expiredAt := now.Add(-time.Hour)
+	tests := []struct {
+		name    string
+		account service.Account
+	}{
+		{
+			name: "manually disabled",
+			account: service.Account{
+				ID:          2,
+				Platform:    service.PlatformOpenAI,
+				Status:      service.StatusActive,
+				Schedulable: false,
+			},
+		},
+		{
+			name: "auto paused after expiry",
+			account: service.Account{
+				ID:                 3,
+				Platform:           service.PlatformOpenAI,
+				Status:             service.StatusActive,
+				Schedulable:        true,
+				AutoPauseOnExpired: true,
+				ExpiresAt:          &expiredAt,
+			},
+		},
+	}
+
+	for index, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			groupID := int64(40 + index)
+			mappedAccount := service.Account{
+				ID:          1,
+				Platform:    service.PlatformOpenAI,
+				Status:      service.StatusActive,
+				Schedulable: true,
+				Credentials: map[string]any{
+					"model_mapping": map[string]any{
+						"gpt-5.5": "gpt-5.5",
+					},
+				},
+			}
+			h := newGatewayModelsHandlerForTest(
+				&gatewayModelsAccountRepoStub{
+					catalogByGroup: map[int64][]service.Account{
+						groupID: {mappedAccount, tt.account},
+					},
+				},
+			)
+
+			rec := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+			c.Request = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+			c.Set(string(middleware2.ContextKeyAPIKey), &service.APIKey{
+				Group: &service.Group{ID: groupID, Platform: service.PlatformOpenAI},
+			})
+
+			h.Models(c)
+
+			require.Equal(t, http.StatusOK, rec.Code)
+
+			var got gatewayModelsResponseForTest
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+			ids := modelIDsForTest(got.Data)
+			require.Equal(t, []string{"gpt-5.5"}, ids)
+			require.NotContains(t, ids, "gpt-5.6-sol")
+			require.NotContains(t, ids, "gpt-5.6-terra")
+			require.NotContains(t, ids, "gpt-5.6-luna")
+		})
+	}
 }
 
 func TestGatewayModels_CustomModelsListFiltersAndOrdersMappedModels(t *testing.T) {

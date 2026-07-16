@@ -639,6 +639,31 @@ func TestAccountSupportsOpenAIEndpointCapability(t *testing.T) {
 	})
 }
 
+func TestAccountSupportsOpenAIResponsesImageGenerationCapability(t *testing.T) {
+	t.Run("OAuth account supports native Responses image tool", func(t *testing.T) {
+		account := &Account{Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+		require.True(t, account.SupportsOpenAIEndpointCapability(OpenAIEndpointCapabilityResponsesImageGeneration))
+	})
+
+	t.Run("official API key supports native Responses image tool", func(t *testing.T) {
+		account := &Account{Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Credentials: map[string]any{"base_url": "https://api.openai.com/v1"}}
+		require.True(t, account.SupportsOpenAIEndpointCapability(OpenAIEndpointCapabilityResponsesImageGeneration))
+	})
+
+	t.Run("third party API key requires explicit opt in", func(t *testing.T) {
+		account := &Account{Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Credentials: map[string]any{"base_url": "https://compat.example/v1"}}
+		require.False(t, account.SupportsOpenAIEndpointCapability(OpenAIEndpointCapabilityResponsesImageGeneration))
+	})
+
+	t.Run("third party API key can explicitly opt in", func(t *testing.T) {
+		account := &Account{Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Credentials: map[string]any{
+			"base_url":            "https://compat.example/v1",
+			"openai_capabilities": []any{"chat_completions", "responses_image_generation"},
+		}}
+		require.True(t, account.SupportsOpenAIEndpointCapability(OpenAIEndpointCapabilityResponsesImageGeneration))
+	})
+}
+
 func TestBuildOpenAIImagesURL_HandlesVersionedBaseURL(t *testing.T) {
 	require.Equal(t,
 		"https://image-upstream.example/v1/images/generations",

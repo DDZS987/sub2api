@@ -156,7 +156,7 @@ func (h *OpenAIGatewayHandler) Embeddings(c *gin.Context) {
 		account := selection.Account
 		setOpsSelectedAccount(c, account.ID, account.Platform)
 
-		accountReleaseFunc, accountAcquired := h.acquireResponsesAccountSlot(c, apiKey.GroupID, "", selection, false, &streamStarted, reqLog)
+		accountReleaseFunc, accountAcquired := h.acquireResponsesAccountSlot(c.Request.Context(), c, apiKey.GroupID, "", selection, false, &streamStarted, reqLog)
 		if !accountAcquired {
 			return
 		}

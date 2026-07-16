@@ -897,6 +897,70 @@ func (s *APIKeyService) GetAvailableGroups(ctx context.Context, userID int64) ([
 	return availableGroups, nil
 }
 
+// GetUserAssignedGroupIDs returns group IDs that are explicitly tied to the user.
+// It intentionally excludes public non-exclusive groups that the user could bind
+// but has not been assigned, so read-only upstream status pages do not leak
+// unrelated shared group health.
+func (s *APIKeyService) GetUserAssignedGroupIDs(ctx context.Context, userID int64) ([]int64, error) {
+	seen := make(map[int64]struct{})
+	var ids []int64
+
+	keys, _, err := s.List(ctx, userID, pagination.PaginationParams{
+		Page:      1,
+		PageSize:  1000,
+		SortBy:    "created_at",
+		SortOrder: pagination.SortOrderDesc,
+	}, APIKeyListFilters{})
+	if err != nil {
+		return nil, err
+	}
+	for i := range keys {
+		if keys[i].GroupID == nil || *keys[i].GroupID <= 0 {
+			continue
+		}
+		id := *keys[i].GroupID
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+
+	user, err := s.userRepo.GetByID(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("get user: %w", err)
+	}
+	for _, id := range user.AllowedGroups {
+		if id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+
+	activeSubscriptions, err := s.userSubRepo.ListActiveByUserID(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("list active subscriptions: %w", err)
+	}
+	for i := range activeSubscriptions {
+		id := activeSubscriptions[i].GroupID
+		if id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids, nil
+}
+
 // canUserBindGroupInternal 内部方法，检查用户是否可以绑定分组（使用预加载的订阅数据）
 func (s *APIKeyService) canUserBindGroupInternal(user *User, group *Group, subscribedGroupIDs map[int64]bool) bool {
 	// 订阅类型分组：需要有效订阅

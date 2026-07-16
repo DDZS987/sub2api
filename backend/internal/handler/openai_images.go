@@ -212,7 +212,7 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 		reqLog.Debug("openai.images.account_selected", zap.Int64("account_id", account.ID), zap.String("account_name", account.Name))
 		setOpsSelectedAccount(c, account.ID, account.Platform)
 
-		accountReleaseFunc, acquired := h.acquireResponsesAccountSlot(c, apiKey.GroupID, sessionHash, selection, parsed.Stream, &streamStarted, reqLog)
+		accountReleaseFunc, acquired := h.acquireResponsesAccountSlot(c.Request.Context(), c, apiKey.GroupID, sessionHash, selection, parsed.Stream, &streamStarted, reqLog)
 		if !acquired {
 			return
 		}
@@ -333,7 +333,14 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 					zap.Int64("account_id", account.ID),
 					zap.Bool("fallback_error_response_written", wroteFallback),
 					zap.Bool("upstream_error_response_already_written", upstreamErrorAlreadyCommunicated),
+					zap.String("endpoint", parsed.Endpoint),
+					zap.Int("body_bytes", len(body)),
+					zap.String("response_format", parsed.ResponseFormat),
+					zap.Strings("timeout_headers", collectOpenAIImagesTimeoutHeaders(c.Request.Header)),
 					zap.Error(err),
+				}
+				if ctxErr := c.Request.Context().Err(); ctxErr != nil {
+					fields = append(fields, zap.String("request_context_err", ctxErr.Error()))
 				}
 				if shouldLogOpenAIForwardFailureAsWarn(c, wroteFallback) {
 					reqLog.Warn("openai.images.forward_failed", fields...)
@@ -411,4 +418,26 @@ func (h *OpenAIGatewayHandler) openAIImagesJSONKeepaliveInterval() time.Duration
 
 func isMultipartImagesContentType(contentType string) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(contentType)), "multipart/form-data")
+}
+
+func collectOpenAIImagesTimeoutHeaders(h http.Header) []string {
+	if h == nil {
+		return nil
+	}
+	keys := []string{
+		"x-stainless-timeout",
+		"x-stainless-read-timeout",
+		"x-stainless-connect-timeout",
+		"x-request-timeout",
+		"request-timeout",
+		"grpc-timeout",
+		"timeout",
+	}
+	matched := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if value := strings.TrimSpace(h.Get(key)); value != "" {
+			matched = append(matched, http.CanonicalHeaderKey(key)+"="+value)
+		}
+	}
+	return matched
 }

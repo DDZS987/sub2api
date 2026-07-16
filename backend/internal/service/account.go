@@ -6,6 +6,7 @@ import (
 	"errors"
 	"hash/fnv"
 	"log/slog"
+	"net/url"
 	"reflect"
 	"sort"
 	"strconv"
@@ -94,7 +95,8 @@ const (
 	// （openai_responses_supported / openai_responses_mode），而非
 	// credentials["openai_capabilities"] 配置集。仅用于生图意图的 /v1/responses
 	// 调度，避免把请求调度到会在 forward 阶段被降级为 Chat Completions 的账号（#4417）。
-	OpenAIEndpointCapabilityResponses OpenAIEndpointCapability = "responses"
+	OpenAIEndpointCapabilityResponses                OpenAIEndpointCapability = "responses"
+	OpenAIEndpointCapabilityResponsesImageGeneration OpenAIEndpointCapability = "responses_image_generation"
 )
 
 const openAIEndpointCapabilitiesCredentialKey = "openai_capabilities"
@@ -1411,6 +1413,7 @@ func (a *Account) SupportsOpenAIEndpointCapability(capability OpenAIEndpointCapa
 	if a.IsGrok() {
 		return capability == OpenAIEndpointCapabilityChatCompletions
 	}
+	configured, found := a.openAIEndpointCapabilitySet()
 	switch capability {
 	case OpenAIEndpointCapabilityChatCompletions:
 	case OpenAIEndpointCapabilityResponses:
@@ -1435,11 +1438,25 @@ func (a *Account) SupportsOpenAIEndpointCapability(capability OpenAIEndpointCapa
 		if a.Type != AccountTypeAPIKey {
 			return false
 		}
+	case OpenAIEndpointCapabilityResponsesImageGeneration:
+		if a.Type == AccountTypeOAuth {
+			break
+		}
+		if a.Type != AccountTypeAPIKey {
+			return false
+		}
+		if !openai_compat.ShouldUseResponsesAPI(a.Extra) {
+			return false
+		}
+		if found {
+			return configured[string(capability)]
+		}
+		baseURL, err := url.Parse(strings.TrimSpace(a.GetOpenAIBaseURL()))
+		return err == nil && strings.EqualFold(baseURL.Hostname(), "api.openai.com")
 	default:
 		return false
 	}
 
-	configured, found := a.openAIEndpointCapabilitySet()
 	if !found {
 		return true
 	}

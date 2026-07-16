@@ -217,6 +217,47 @@ func isImageGenNamespaceTool(tool gjson.Result) bool {
 		isOpenAIImageGenNamespaceName(openAIJSONString(tool.Get("name")))
 }
 
+func openAIJSONToolsContainCodexImageGenNamespace(tools gjson.Result) bool {
+	if !tools.IsArray() {
+		return false
+	}
+	found := false
+	tools.ForEach(func(_, item gjson.Result) bool {
+		if isImageGenNamespaceTool(item) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// openAIRequestBodyHasCodexImageGenNamespace reports whether Codex already
+// exposed its local image_gen extension to the model. In that case the gateway
+// must not add the server-side image_generation tool: the local extension is
+// what saves the returned bytes and emits the native image card in Codex.
+func openAIRequestBodyHasCodexImageGenNamespace(body []byte) bool {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return false
+	}
+	if openAIJSONToolsContainCodexImageGenNamespace(gjson.GetBytes(body, "tools")) {
+		return true
+	}
+	input := gjson.GetBytes(body, "input")
+	if !input.IsArray() {
+		return false
+	}
+	found := false
+	input.ForEach(func(_, item gjson.Result) bool {
+		if openAIJSONString(item.Get("type")) != "additional_tools" {
+			return true
+		}
+		found = openAIJSONToolsContainCodexImageGenNamespace(item.Get("tools"))
+		return !found
+	})
+	return found
+}
+
 // openAIJSONInputContainsImageGenTool scans Responses input items for
 // additional_tools entries that declare the image_gen namespace. This covers
 // the "Responses Lite" format where tools are embedded inside input items
@@ -243,6 +284,115 @@ func openAIRequestBodyHasImageGenerationDeclaration(body []byte) bool {
 	return openAIJSONToolsContainImageGeneration(gjson.GetBytes(body, "tools")) ||
 		openAIJSONInputContainsImageGenTool(gjson.GetBytes(body, "input")) ||
 		openAIJSONToolChoiceSelectsImageGeneration(gjson.GetBytes(body, "tool_choice"))
+}
+
+func openAIRequestBodyHasNativeImageGenerationTool(body []byte) bool {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return false
+	}
+	tools := gjson.GetBytes(body, "tools")
+	if !tools.IsArray() {
+		return false
+	}
+	found := false
+	tools.ForEach(func(_, item gjson.Result) bool {
+		if isOpenAIImageGenerationType(openAIJSONString(item.Get("type"))) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// isExplicitCodexImageGenerationUserRequest recognizes direct requests to
+// create or edit an image from the latest user message. It intentionally avoids
+// broad "image generation" mentions so code, API, documentation, and debugging
+// discussions keep the normal automatic tool policy.
+func isExplicitCodexImageGenerationUserRequest(body []byte) bool {
+	text := strings.ToLower(strings.TrimSpace(ExtractContentModerationText(
+		ContentModerationProtocolOpenAIResponses,
+		body,
+	)))
+	if text == "" {
+		return false
+	}
+
+	for _, phrase := range []string{
+		"不要生成图片", "不要生成图像", "不要画图", "不要绘图", "别生成图片", "别画图", "无需生成图片",
+		"do not generate an image", "don't generate an image", "do not create an image", "without generating an image",
+	} {
+		if strings.Contains(text, phrase) {
+			return false
+		}
+	}
+	for _, phrase := range []string{
+		"生成图片的代码", "生成图像的代码", "图片生成代码", "图像生成代码", "图片生成接口", "图像生成接口",
+		"图片生成api", "图像生成api", "图片生成逻辑", "图像生成逻辑", "为什么不能生成图片", "为什么无法生成图片",
+		"为什么没有生成图片", "为什么不生成图片", "画图代码", "绘图代码", "画图函数", "绘图函数", "用代码画", "写代码画",
+		"how to generate an image", "code to generate an image", "write code to draw", "code that draws", "draw a conclusion",
+		"draw a comparison", "image generation api", "image generation code", "image upload", "image component",
+		"why image generation", "explain image generation",
+	} {
+		if strings.Contains(text, phrase) {
+			return false
+		}
+	}
+
+	trimmed := strings.TrimSpace(text)
+	if strings.HasPrefix(trimmed, "/image ") || strings.HasPrefix(trimmed, "$imagegen ") {
+		return true
+	}
+	for _, prefix := range []string{"draw a ", "draw an ", "draw me ", "please draw a ", "please draw an ", "can you draw a ", "could you draw a "} {
+		if strings.HasPrefix(trimmed, prefix) {
+			return true
+		}
+	}
+	for _, phrase := range []string{
+		"生成一张", "生成一幅", "画一张", "画一幅", "绘制一张", "绘制一幅", "创作一张", "制作一张", "创建一张",
+		"给我画", "帮我画", "为我画", "请画", "请绘制", "帮我绘制", "给我生成", "帮我生成", "为我生成",
+		"编辑这张图片", "编辑这张图", "修改这张图片", "修改这张图", "重绘这张图片", "重绘这张图", "把这张图片改", "把这张图改",
+		"generate an image", "generate a picture", "generate a photo", "create an image", "create a picture", "create a photo",
+		"make me an image", "make me a picture", "design a logo", "create a logo",
+		"edit this image", "edit the image", "modify this image", "turn this image into",
+	} {
+		if strings.Contains(text, phrase) {
+			return true
+		}
+	}
+
+	visualObject := containsAnyString(text, []string{
+		"图片", "图像", "照片", "插画", "海报", "封面", "头像", "壁纸", "图标", "logo", "标志",
+	})
+	directAction := containsAnyString(text, []string{
+		"请生成", "帮我生成", "给我生成", "为我生成", "请创作", "帮我创作", "请制作", "帮我制作", "请设计", "帮我设计",
+	})
+	return visualObject && directAction
+}
+
+// IsOpenAIResponsesImageGenerationExecutionIntent reports whether this turn is
+// expected to execute image generation, rather than merely advertising the
+// optional image tool in every Codex request.
+func IsOpenAIResponsesImageGenerationExecutionIntent(requestedModel string, body []byte) bool {
+	if isOpenAIImageGenerationModel(requestedModel) || len(body) == 0 || !gjson.ValidBytes(body) {
+		return isOpenAIImageGenerationModel(requestedModel)
+	}
+	if model := strings.TrimSpace(gjson.GetBytes(body, "model").String()); isOpenAIImageGenerationModel(model) {
+		return true
+	}
+	if openAIJSONToolChoiceSelectsImageGeneration(gjson.GetBytes(body, "tool_choice")) {
+		return true
+	}
+	return isExplicitCodexImageGenerationUserRequest(body)
+}
+
+func containsAnyString(value string, candidates []string) bool {
+	for _, candidate := range candidates {
+		if strings.Contains(value, candidate) {
+			return true
+		}
+	}
+	return false
 }
 
 func openAIRequestBodyImageGenerationToolNeedsNormalization(body []byte) bool {

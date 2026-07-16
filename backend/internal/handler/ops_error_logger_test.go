@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -136,6 +137,58 @@ func TestOpsErrorLoggerMiddleware_DoesNotBreakOuterMiddlewares(t *testing.T) {
 	require.NotPanics(t, func() {
 		r.ServeHTTP(rec, req)
 	})
+	require.Equal(t, http.StatusNoContent, rec.Code)
+}
+
+func TestOpsErrorLoggerMiddleware_RestoresWriterWrappedByCompactKeepalive(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	r := gin.New()
+	r.Use(middleware2.Recovery())
+	r.Use(middleware2.RequestLogger())
+	r.Use(middleware2.Logger())
+	r.POST("/responses", OpsErrorLoggerMiddleware(nil), func(c *gin.Context) {
+		service.MarkOpenAICompactClientStream(c)
+		stopKeepalive := service.StartOpenAICompactSSEKeepalive(c, time.Hour)
+		defer stopKeepalive()
+		c.Status(http.StatusNoContent)
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/responses", nil)
+
+	require.NotPanics(t, func() {
+		r.ServeHTTP(rec, req)
+	})
+	require.Equal(t, http.StatusNoContent, rec.Code)
+}
+
+func TestOpsErrorLoggerMiddleware_DoesNotPoolWriterRetainedByCompactState(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var adjustedSize int
+	observedCompactState := false
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Next()
+		adjustedSize = service.OpenAICompactKeepaliveAdjustedWrittenSize(c)
+		observedCompactState = true
+	})
+	r.POST("/responses", OpsErrorLoggerMiddleware(nil), func(c *gin.Context) {
+		service.MarkOpenAICompactClientStream(c)
+		stopKeepalive := service.StartOpenAICompactSSEKeepalive(c, time.Hour)
+		defer stopKeepalive()
+		c.Status(http.StatusNoContent)
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/responses", nil)
+
+	require.NotPanics(t, func() {
+		r.ServeHTTP(rec, req)
+	})
+	require.True(t, observedCompactState)
+	require.Equal(t, -1, adjustedSize)
 	require.Equal(t, http.StatusNoContent, rec.Code)
 }
 

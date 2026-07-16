@@ -57,6 +57,9 @@ config.local.yaml
 *.log
 logs/
 
+# Production database backups must never enter the build context
+backups/
+
 # Temporary files
 tmp/
 temp/

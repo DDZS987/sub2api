@@ -110,10 +110,12 @@ type modelsListAccountRepoStub struct {
 	AccountRepository
 
 	byGroup map[int64][]Account
+	active  []Account
 	all     []Account
 	err     error
 
 	listByGroupCalls atomic.Int64
+	listActiveCalls  atomic.Int64
 	listAllCalls     atomic.Int64
 }
 
@@ -155,6 +157,30 @@ func (s *modelsListAccountRepoStub) ListSchedulableByGroupID(ctx context.Context
 	}
 	out := make([]Account, len(accounts))
 	copy(out, accounts)
+	return out, nil
+}
+
+func (s *modelsListAccountRepoStub) ListByGroup(ctx context.Context, groupID int64) ([]Account, error) {
+	s.listByGroupCalls.Add(1)
+	if s.err != nil {
+		return nil, s.err
+	}
+	accounts, ok := s.byGroup[groupID]
+	if !ok {
+		return nil, nil
+	}
+	out := make([]Account, len(accounts))
+	copy(out, accounts)
+	return out, nil
+}
+
+func (s *modelsListAccountRepoStub) ListActive(ctx context.Context) ([]Account, error) {
+	s.listActiveCalls.Add(1)
+	if s.err != nil {
+		return nil, s.err
+	}
+	out := make([]Account, len(s.active))
+	copy(out, s.active)
 	return out, nil
 }
 
@@ -471,8 +497,9 @@ func TestGetAvailableModels_UsesShortCacheAndSupportsInvalidation(t *testing.T) 
 		byGroup: map[int64][]Account{
 			groupID: {
 				{
-					ID:       1,
-					Platform: PlatformAnthropic,
+					ID:          1,
+					Platform:    PlatformAnthropic,
+					Schedulable: true,
 					Credentials: map[string]any{
 						"model_mapping": map[string]any{
 							"claude-3-5-sonnet": "claude-3-5-sonnet",
@@ -481,8 +508,9 @@ func TestGetAvailableModels_UsesShortCacheAndSupportsInvalidation(t *testing.T) 
 					},
 				},
 				{
-					ID:       2,
-					Platform: PlatformGemini,
+					ID:          2,
+					Platform:    PlatformGemini,
+					Schedulable: true,
 					Credentials: map[string]any{
 						"model_mapping": map[string]any{
 							"gemini-2.5-pro": "gemini-2.5-pro",
@@ -511,8 +539,9 @@ func TestGetAvailableModels_UsesShortCacheAndSupportsInvalidation(t *testing.T) 
 	// 更新仓储数据，但缓存未失效前应继续返回旧值。
 	repo.byGroup[groupID] = []Account{
 		{
-			ID:       3,
-			Platform: PlatformAnthropic,
+			ID:          3,
+			Platform:    PlatformAnthropic,
+			Schedulable: true,
 			Credentials: map[string]any{
 				"model_mapping": map[string]any{
 					"claude-3-7-sonnet": "claude-3-7-sonnet",
@@ -549,10 +578,11 @@ func TestGetAvailableModels_ErrorAndGlobalListBranches(t *testing.T) {
 	require.Nil(t, svcErr.GetAvailableModels(context.Background(), nil, ""))
 
 	okRepo := &modelsListAccountRepoStub{
-		all: []Account{
+		active: []Account{
 			{
-				ID:       1,
-				Platform: PlatformAnthropic,
+				ID:          1,
+				Platform:    PlatformAnthropic,
+				Schedulable: true,
 				Credentials: map[string]any{
 					"model_mapping": map[string]any{
 						"claude-3-5-sonnet": "claude-3-5-sonnet",
@@ -560,8 +590,9 @@ func TestGetAvailableModels_ErrorAndGlobalListBranches(t *testing.T) {
 				},
 			},
 			{
-				ID:       2,
-				Platform: PlatformGemini,
+				ID:          2,
+				Platform:    PlatformGemini,
+				Schedulable: true,
 				Credentials: map[string]any{
 					"model_mapping": map[string]any{
 						"gemini-2.5-pro": "gemini-2.5-pro",
@@ -577,7 +608,44 @@ func TestGetAvailableModels_ErrorAndGlobalListBranches(t *testing.T) {
 	}
 	models := svcOK.GetAvailableModels(context.Background(), nil, "")
 	require.Equal(t, []string{"claude-3-5-sonnet", "gemini-2.5-pro"}, models)
-	require.Equal(t, int64(1), okRepo.listAllCalls.Load())
+	require.Equal(t, int64(1), okRepo.listActiveCalls.Load())
+}
+
+func TestGetAvailableModels_RateLimitedOpenAIUnmappedAccountStillAddsDefaultModels(t *testing.T) {
+	groupID := int64(33)
+	resetAt := time.Now().Add(time.Hour)
+	repo := &modelsListAccountRepoStub{
+		byGroup: map[int64][]Account{
+			groupID: {
+				{
+					ID:          1,
+					Platform:    PlatformOpenAI,
+					Schedulable: true,
+					Credentials: map[string]any{
+						"model_mapping": map[string]any{
+							"gpt-5.5": "gpt-5.5",
+						},
+					},
+				},
+				{
+					ID:               2,
+					Platform:         PlatformOpenAI,
+					Schedulable:      true,
+					RateLimitResetAt: &resetAt,
+				},
+			},
+		},
+	}
+	svc := &GatewayService{accountRepo: repo}
+
+	models := svc.GetAvailableModels(context.Background(), &groupID, PlatformOpenAI)
+
+	require.Contains(t, models, "gpt-5.5")
+	require.Contains(t, models, "gpt-5.6-sol")
+	require.Contains(t, models, "gpt-5.6-terra")
+	require.Contains(t, models, "gpt-5.6-luna")
+	require.Equal(t, int64(1), repo.listByGroupCalls.Load())
+	require.Equal(t, int64(0), repo.listAllCalls.Load(), "model catalog must not use realtime schedulable query")
 }
 
 func TestGatewayHotpathHelpers_CacheTTLAndStickyContext(t *testing.T) {

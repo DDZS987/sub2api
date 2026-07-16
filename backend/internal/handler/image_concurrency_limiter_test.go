@@ -1,7 +1,9 @@
 package handler
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,6 +17,48 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 )
+
+type codexImageBridgeConcurrencyAccountRepo struct {
+	service.AccountRepository
+	account service.Account
+}
+
+func (r codexImageBridgeConcurrencyAccountRepo) GetByID(_ context.Context, id int64) (*service.Account, error) {
+	if r.account.ID != id {
+		return nil, service.ErrNoAvailableAccounts
+	}
+	account := r.account
+	return &account, nil
+}
+
+func (r codexImageBridgeConcurrencyAccountRepo) ListSchedulableByGroupIDAndPlatform(_ context.Context, _ int64, platform string) ([]service.Account, error) {
+	return r.accountsForPlatform(platform), nil
+}
+
+func (r codexImageBridgeConcurrencyAccountRepo) ListSchedulableByPlatform(_ context.Context, platform string) ([]service.Account, error) {
+	return r.accountsForPlatform(platform), nil
+}
+
+func (r codexImageBridgeConcurrencyAccountRepo) ListSchedulableUngroupedByPlatform(_ context.Context, platform string) ([]service.Account, error) {
+	return r.accountsForPlatform(platform), nil
+}
+
+func (r codexImageBridgeConcurrencyAccountRepo) accountsForPlatform(platform string) []service.Account {
+	if r.account.Platform != platform {
+		return nil
+	}
+	return []service.Account{r.account}
+}
+
+type codexImageBridgeConcurrencyUpstream struct {
+	service.HTTPUpstream
+	calls int
+}
+
+func (u *codexImageBridgeConcurrencyUpstream) Do(_ *http.Request, _ string, _ int64, _ int) (*http.Response, error) {
+	u.calls++
+	return nil, errors.New("unexpected upstream request")
+}
 
 func TestImageConcurrencyLimiter_DefaultDisabledAllowsRequests(t *testing.T) {
 	limiter := &imageConcurrencyLimiter{}
@@ -227,4 +271,100 @@ func TestOpenAIGatewayHandlerResponses_TextOnlyNotRejectedByImageConcurrency(t *
 
 	require.NotEqual(t, http.StatusTooManyRequests, rec.Code)
 	require.NotContains(t, rec.Body.String(), "Image generation concurrency limit exceeded")
+}
+
+func TestOpenAIGatewayHandlerResponses_AutoInjectedImageBridgeRejectedBeforeUpstreamWhenImageConcurrencyFull(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	groupID := int64(3001)
+	accountRepo := codexImageBridgeConcurrencyAccountRepo{account: service.Account{
+		ID:          4001,
+		Name:        "openai-codex-image-bridge",
+		Platform:    service.PlatformOpenAI,
+		Type:        service.AccountTypeOAuth,
+		Status:      service.StatusActive,
+		Schedulable: true,
+		Concurrency: 0,
+		Credentials: map[string]any{
+			"access_token":       "test-token",
+			"chatgpt_account_id": "test-account",
+		},
+		Extra: map[string]any{
+			"openai_passthrough":            true,
+			"codex_image_generation_bridge": true,
+		},
+	}}
+	upstream := &codexImageBridgeConcurrencyUpstream{}
+	cfg := &config.Config{RunMode: config.RunModeSimple}
+	cfg.Gateway.ImageConcurrency = config.ImageConcurrencyConfig{
+		Enabled:               true,
+		MaxConcurrentRequests: 1,
+		OverflowMode:          config.ImageConcurrencyOverflowModeReject,
+	}
+	billingCacheService := service.NewBillingCacheService(nil, nil, nil, nil, nil, nil, cfg, nil)
+	t.Cleanup(billingCacheService.Stop)
+	gatewayService := service.NewOpenAIGatewayService(
+		accountRepo,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		cfg,
+		nil,
+		nil,
+		service.NewBillingService(cfg, nil),
+		nil,
+		billingCacheService,
+		upstream,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+	)
+	handler := NewOpenAIGatewayHandler(
+		gatewayService,
+		service.NewConcurrencyService(nil),
+		billingCacheService,
+		service.NewAPIKeyService(nil, nil, nil, nil, nil, nil, cfg),
+		nil,
+		nil,
+		nil,
+		nil,
+		cfg,
+	)
+	release, acquired := handler.imageLimiter.TryAcquire(true, 1)
+	require.True(t, acquired)
+	require.NotNil(t, release)
+	defer release()
+
+	body := []byte(`{"model":"gpt-5.4","stream":false,"input":"write code"}`)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("User-Agent", "codex_cli_rs/0.1.0")
+	c.Set(string(middleware2.ContextKeyAPIKey), &service.APIKey{
+		ID:      5001,
+		GroupID: &groupID,
+		Group: &service.Group{
+			ID:                   groupID,
+			Platform:             service.PlatformOpenAI,
+			Status:               service.StatusActive,
+			AllowImageGeneration: true,
+		},
+		User: &service.User{ID: 6001, Status: service.StatusActive},
+	})
+	c.Set(string(middleware2.ContextKeyUser), middleware2.AuthSubject{UserID: 6001, Concurrency: 0})
+
+	handler.Responses(c)
+
+	require.Equal(t, http.StatusTooManyRequests, rec.Code)
+	require.Equal(t, "rate_limit_error", gjson.GetBytes(rec.Body.Bytes(), "error.type").String())
+	require.Contains(t, rec.Body.String(), "Image generation concurrency limit exceeded")
+	require.Zero(t, upstream.calls)
 }

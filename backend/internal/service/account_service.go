@@ -269,6 +269,15 @@ func (s *AccountService) List(ctx context.Context, params pagination.PaginationP
 	return accounts, pagination, nil
 }
 
+// ListWithFilters 获取按平台、类型、状态等条件筛选后的账号列表。
+func (s *AccountService) ListWithFilters(ctx context.Context, params pagination.PaginationParams, platform, accountType, status, search string, groupID int64, privacyMode string) ([]Account, *pagination.PaginationResult, error) {
+	accounts, result, err := s.accountRepo.ListWithFilters(ctx, params, platform, accountType, status, search, groupID, privacyMode)
+	if err != nil {
+		return nil, nil, fmt.Errorf("list accounts with filters: %w", err)
+	}
+	return accounts, result, nil
+}
+
 // ListByPlatform 根据平台获取账号列表
 func (s *AccountService) ListByPlatform(ctx context.Context, platform string) ([]Account, error) {
 	accounts, err := s.accountRepo.ListByPlatform(ctx, platform)

@@ -72,6 +72,7 @@ func TestHandleOpenAIUpstreamTransportError_PersistentEvictsAndFailsOver(t *test
 	var fo *UpstreamFailoverError
 	require.True(t, errors.As(retErr, &fo), "persistent error must return *UpstreamFailoverError")
 	require.Equal(t, http.StatusBadGateway, fo.StatusCode)
+	require.True(t, fo.AllowCrossAffinity, "proxy transport errors must be allowed to fail over across OAuth/APIKey affinity")
 
 	// Persistent → account temporarily unscheduled for ~10min, reason carries cause.
 	require.Len(t, repo.tempUnschedCalls, 1)
@@ -100,6 +101,7 @@ func TestHandleOpenAIUpstreamTransportError_TransientFailsOverWithoutEviction(t 
 	var fo *UpstreamFailoverError
 	require.True(t, errors.As(err, &fo), "transient error must return *UpstreamFailoverError")
 	require.Equal(t, http.StatusBadGateway, fo.StatusCode)
+	require.True(t, fo.AllowCrossAffinity, "transient transport errors should also be able to use direct relay fallback")
 
 	// Transient → do NOT evict.
 	require.Empty(t, repo.tempUnschedCalls)
@@ -175,6 +177,7 @@ func TestHandleOpenAIUpstreamTransportError_DeadlineExceeded_StillFailsOver(t *t
 
 	var fo *UpstreamFailoverError
 	require.True(t, errors.As(err, &fo), "context.DeadlineExceeded must still return *UpstreamFailoverError")
+	require.True(t, fo.AllowCrossAffinity, "deadline transport errors should be able to use direct relay fallback")
 }
 
 func TestForwardAsRawChatCompletions_TransportErrorFailsOver(t *testing.T) {

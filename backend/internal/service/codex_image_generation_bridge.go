@@ -1,8 +1,17 @@
 package service
 
-import "strings"
+import (
+	"strings"
 
-const featureKeyCodexImageGenerationBridge = "codex_image_generation_bridge"
+	"github.com/gin-gonic/gin"
+)
+
+const (
+	featureKeyCodexImageGenerationBridge = "codex_image_generation_bridge"
+	codexImageBridgeAppliedContextKey    = "codex_image_generation_bridge_applied"
+	codexLocalImageGenerationHeader      = "x-openai-actor-authorization"
+	codexLocalImageGenerationMarker      = "sub2api"
+)
 
 const (
 	featureKeyCodexImageGenerationExplicitToolPolicy = "codex_image_generation_explicit_tool_policy"
@@ -13,6 +22,36 @@ const (
 
 func boolOverridePtr(v bool) *bool {
 	return &v
+}
+
+func markCodexImageGenerationBridgeApplied(c *gin.Context) {
+	if c != nil {
+		c.Set(codexImageBridgeAppliedContextKey, true)
+	}
+}
+
+func codexImageGenerationBridgeWasApplied(c *gin.Context) bool {
+	if c == nil {
+		return false
+	}
+	v, ok := c.Get(codexImageBridgeAppliedContextKey)
+	applied, _ := v.(bool)
+	return ok && applied
+}
+
+// codexClientUsesLocalImageGeneration detects the project-generated Codex
+// provider configuration. That configuration enables Codex's local image_gen
+// extension, which is responsible for saving image bytes and emitting the
+// native Desktop/App image card. The marker header is consumed locally and is
+// intentionally not part of the upstream passthrough allowlist.
+func codexClientUsesLocalImageGeneration(c *gin.Context) bool {
+	if c == nil {
+		return false
+	}
+	return strings.EqualFold(
+		strings.TrimSpace(c.GetHeader(codexLocalImageGenerationHeader)),
+		codexLocalImageGenerationMarker,
+	)
 }
 
 func boolOverrideFromMap(values map[string]any, keys ...string) *bool {

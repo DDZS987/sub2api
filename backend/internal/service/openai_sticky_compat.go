@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -96,7 +97,39 @@ func (s *OpenAIGatewayService) openAISessionCacheKey(sessionHash string) string 
 	return "openai:" + normalized
 }
 
+func (s *OpenAIGatewayService) openAISessionAffinityCacheKey(sessionHash string, affinity OpenAIAccountAffinityDomain) string {
+	baseKey := s.openAISessionCacheKey(sessionHash)
+	if baseKey == "" {
+		return ""
+	}
+	normalized := normalizeOpenAIAccountAffinity(affinity)
+	if normalized == OpenAIAccountAffinityAny {
+		return ""
+	}
+	return baseKey + ":affinity:" + string(normalized)
+}
+
+func (s *OpenAIGatewayService) openAISessionScopedCacheKeys(sessionHash string) []string {
+	keys := make([]string, 0, 2)
+	for _, affinity := range []OpenAIAccountAffinityDomain{OpenAIAccountAffinityOAuth, OpenAIAccountAffinityAPIKey} {
+		if key := s.openAISessionAffinityCacheKey(sessionHash, affinity); key != "" {
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+func (s *OpenAIGatewayService) openAISessionCacheKeyForContext(ctx context.Context, sessionHash string) string {
+	if !OpenAIStickyAffinityScopeEnabled(ctx) {
+		return s.openAISessionCacheKey(sessionHash)
+	}
+	return s.openAISessionAffinityCacheKey(sessionHash, OpenAIAccountAffinityFromContext(ctx))
+}
+
 func (s *OpenAIGatewayService) openAILegacySessionCacheKey(ctx context.Context, sessionHash string) string {
+	if OpenAIStickyAffinityScopeEnabled(ctx) && OpenAIAccountAffinityFromContext(ctx) != OpenAIAccountAffinityAny {
+		return ""
+	}
 	legacyHash := openAILegacySessionHashFromContext(ctx)
 	if legacyHash == "" {
 		return ""
@@ -124,7 +157,62 @@ func (s *OpenAIGatewayService) getStickySessionAccountID(ctx context.Context, gr
 		return 0, nil
 	}
 
-	primaryKey := s.openAISessionCacheKey(sessionHash)
+	if OpenAIStickyAffinityScopeEnabled(ctx) {
+		affinity := OpenAIAccountAffinityFromContext(ctx)
+		if affinity != OpenAIAccountAffinityAny {
+			primaryKey := s.openAISessionCacheKeyForContext(ctx, sessionHash)
+			if primaryKey == "" {
+				return 0, nil
+			}
+			accountID, err := s.cache.GetSessionAccountID(ctx, derefGroupID(groupID), primaryKey)
+			if err == nil && accountID > 0 {
+				slog.Debug("openai.sticky_affinity_read_hit",
+					"group_id", derefGroupID(groupID),
+					"session_hash", strings.TrimSpace(sessionHash),
+					"account_id", accountID,
+					"affinity", OpenAIAccountAffinityLogValue(affinity),
+				)
+			}
+			return accountID, err
+		}
+
+		var matchedID int64
+		var matchedAffinity OpenAIAccountAffinityDomain
+		for _, affinity := range []OpenAIAccountAffinityDomain{OpenAIAccountAffinityOAuth, OpenAIAccountAffinityAPIKey} {
+			key := s.openAISessionAffinityCacheKey(sessionHash, affinity)
+			if key == "" {
+				continue
+			}
+			accountID, err := s.cache.GetSessionAccountID(ctx, derefGroupID(groupID), key)
+			if err != nil || accountID <= 0 {
+				continue
+			}
+			if matchedID > 0 && matchedID != accountID {
+				slog.Warn("openai.sticky_affinity_conflict",
+					"group_id", derefGroupID(groupID),
+					"session_hash", strings.TrimSpace(sessionHash),
+					"first_account_id", matchedID,
+					"first_affinity", OpenAIAccountAffinityLogValue(matchedAffinity),
+					"conflict_account_id", accountID,
+					"conflict_affinity", OpenAIAccountAffinityLogValue(affinity),
+				)
+				return 0, nil
+			}
+			matchedID = accountID
+			matchedAffinity = affinity
+		}
+		if matchedID > 0 {
+			slog.Debug("openai.sticky_affinity_read_hit",
+				"group_id", derefGroupID(groupID),
+				"session_hash", strings.TrimSpace(sessionHash),
+				"account_id", matchedID,
+				"affinity", OpenAIAccountAffinityLogValue(matchedAffinity),
+			)
+		}
+		return matchedID, nil
+	}
+
+	primaryKey := s.openAISessionCacheKeyForContext(ctx, sessionHash)
 	if primaryKey == "" {
 		return 0, nil
 	}
@@ -155,7 +243,7 @@ func (s *OpenAIGatewayService) setStickySessionAccountID(ctx context.Context, gr
 	if s == nil || s.cache == nil || accountID <= 0 {
 		return nil
 	}
-	primaryKey := s.openAISessionCacheKey(sessionHash)
+	primaryKey := s.openAISessionCacheKeyForContext(ctx, sessionHash)
 	if primaryKey == "" {
 		return nil
 	}
@@ -164,6 +252,16 @@ func (s *OpenAIGatewayService) setStickySessionAccountID(ctx context.Context, gr
 		return err
 	}
 
+	if OpenAIStickyAffinityScopeEnabled(ctx) {
+		slog.Info("openai.sticky_affinity_bound",
+			"group_id", derefGroupID(groupID),
+			"session_hash", strings.TrimSpace(sessionHash),
+			"account_id", accountID,
+			"affinity", OpenAIAccountAffinityLogValue(OpenAIAccountAffinityFromContext(ctx)),
+			"ttl_seconds", int64(ttl/time.Second),
+		)
+		return nil
+	}
 	if !s.openAISessionHashDualWriteOldEnabled() {
 		return nil
 	}
@@ -182,8 +280,17 @@ func (s *OpenAIGatewayService) refreshStickySessionTTL(ctx context.Context, grou
 	if s == nil || s.cache == nil {
 		return nil
 	}
-	primaryKey := s.openAISessionCacheKey(sessionHash)
+	primaryKey := s.openAISessionCacheKeyForContext(ctx, sessionHash)
 	if primaryKey == "" {
+		if OpenAIStickyAffinityScopeEnabled(ctx) {
+			var err error
+			for _, key := range s.openAISessionScopedCacheKeys(sessionHash) {
+				if e := s.cache.RefreshSessionTTL(ctx, derefGroupID(groupID), key, ttl); err == nil && e != nil {
+					err = e
+				}
+			}
+			return err
+		}
 		return nil
 	}
 
@@ -203,8 +310,17 @@ func (s *OpenAIGatewayService) deleteStickySessionAccountID(ctx context.Context,
 	if s == nil || s.cache == nil {
 		return nil
 	}
-	primaryKey := s.openAISessionCacheKey(sessionHash)
+	primaryKey := s.openAISessionCacheKeyForContext(ctx, sessionHash)
 	if primaryKey == "" {
+		if OpenAIStickyAffinityScopeEnabled(ctx) {
+			var err error
+			for _, key := range s.openAISessionScopedCacheKeys(sessionHash) {
+				if e := s.cache.DeleteSessionAccountID(ctx, derefGroupID(groupID), key); err == nil && e != nil {
+					err = e
+				}
+			}
+			return err
+		}
 		return nil
 	}
 

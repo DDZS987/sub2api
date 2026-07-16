@@ -61,6 +61,7 @@ type Handlers struct {
 	AvailableChannel *AvailableChannelHandler
 	AsyncImage       *AsyncImageHandler
 	BatchImage       *BatchImageHandler
+	GroupStatus      *GroupStatusHandler
 }
 
 // BuildInfo contains build-time information

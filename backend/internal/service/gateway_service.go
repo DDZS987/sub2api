@@ -20,6 +20,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
 	"github.com/cespare/xxhash/v2"
 	gocache "github.com/patrickmn/go-cache"
@@ -605,6 +606,7 @@ type UpstreamFailoverError struct {
 	NextAccountAction        NextAccountAction
 	ClientStatusCode         int
 	ClientMessage            string
+	AllowCrossAffinity       bool // 代理/网络层错误允许跨 OAuth/APIKey 亲和兜底到其它 OpenAI 账号域
 }
 
 func (e *UpstreamFailoverError) Error() string {
@@ -1150,8 +1152,9 @@ func (s *GatewayService) getOAuthToken(ctx context.Context, account *Account) (s
 	return accessToken, "oauth", nil
 }
 
-// GetAvailableModels returns the list of models available for a group
-// It aggregates model_mapping keys from all schedulable accounts in the group
+// GetAvailableModels returns the stable model catalog for a group.
+// It intentionally ignores transient scheduling state such as rate limits,
+// overloads and temporary upstream failures.
 func (s *GatewayService) GetAvailableModels(ctx context.Context, groupID *int64, platform string) []string {
 	cacheKey := modelsListCacheKey(groupID, platform)
 	if s.modelsListCache != nil {
@@ -1168,37 +1171,58 @@ func (s *GatewayService) GetAvailableModels(ctx context.Context, groupID *int64,
 	var err error
 
 	if groupID != nil {
-		accounts, err = s.accountRepo.ListSchedulableByGroupID(ctx, *groupID)
+		accounts, err = s.accountRepo.ListByGroup(ctx, *groupID)
 	} else {
-		accounts, err = s.accountRepo.ListSchedulable(ctx)
+		accounts, err = s.accountRepo.ListActive(ctx)
 	}
 
-	if err != nil || len(accounts) == 0 {
+	if err != nil {
 		return nil
 	}
 
-	// Filter by platform if specified
-	if platform != "" {
-		filtered := make([]Account, 0)
-		for _, acc := range accounts {
-			if acc.Platform == platform {
-				filtered = append(filtered, acc)
-			}
+	now := time.Now()
+	catalogAccounts := make([]Account, 0, len(accounts))
+	for _, acc := range accounts {
+		if platform != "" && acc.Platform != platform {
+			continue
 		}
-		accounts = filtered
+		if !acc.Schedulable {
+			continue
+		}
+		if acc.AutoPauseOnExpired && acc.ExpiresAt != nil && !now.Before(*acc.ExpiresAt) {
+			continue
+		}
+		catalogAccounts = append(catalogAccounts, acc)
+	}
+	if len(catalogAccounts) == 0 {
+		return nil
 	}
 
-	// Collect unique models from all accounts
+	// Collect unique models from all accounts.
+	// OpenAI accounts without model_mapping are treated as allowing the default
+	// OpenAI model set, so one stale mapped account cannot hide newly added
+	// default models from /v1/models.
 	modelSet := make(map[string]struct{})
 	hasAnyMapping := false
+	hasOpenAIUnmappedAccount := false
 
-	for _, acc := range accounts {
+	for _, acc := range catalogAccounts {
 		mapping := acc.GetModelMapping()
 		if len(mapping) > 0 {
 			hasAnyMapping = true
 			for model := range mapping {
 				modelSet[model] = struct{}{}
 			}
+			continue
+		}
+		if strings.TrimSpace(platform) == PlatformOpenAI && acc.Platform == PlatformOpenAI {
+			hasOpenAIUnmappedAccount = true
+		}
+	}
+
+	if hasAnyMapping && hasOpenAIUnmappedAccount {
+		for _, model := range openai.DefaultModelIDs() {
+			modelSet[model] = struct{}{}
 		}
 	}
 

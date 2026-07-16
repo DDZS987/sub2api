@@ -100,6 +100,10 @@ func (s *OpenAIGatewayService) ForwardAsChatCompletions(
 	}
 	originalModel := chatReq.Model
 	clientStream := chatReq.Stream
+	LogToolCallDebugOpenAIChat("service.openai_gateway.chat_completions", "parsed_openai_request", body,
+		"account_id", account.ID,
+		"account_type", account.Type,
+	)
 
 	// 2. Resolve model mapping early so compat prompt_cache_key injection can
 	// derive a stable seed from the final upstream model family.
@@ -243,6 +247,13 @@ func (s *OpenAIGatewayService) ForwardAsChatCompletions(
 		return nil, policyErr
 	}
 	responsesBody = updatedBody
+	LogToolCallDebugOpenAIResponses("service.openai_gateway.chat_completions", "upstream_responses_request", responsesBody,
+		"account_id", account.ID,
+		"original_model", originalModel,
+		"billing_model", billingModel,
+		"upstream_model", upstreamModel,
+		"responses_shape", isResponsesShape,
+	)
 
 	// 5. Get access token
 	token, _, err := s.GetAccessToken(ctx, account)
@@ -463,6 +474,16 @@ func (s *OpenAIGatewayService) handleChatBufferedStreamingResponse(
 	acc.SupplementResponseOutput(finalResponse)
 
 	chatResp := apicompat.ResponsesToChatCompletions(finalResponse, originalModel)
+	if debugBytes, err := json.Marshal(finalResponse); err == nil {
+		LogToolCallDebugOpenAIResponses("service.openai_gateway.chat_completions", "buffered_responses_final", debugBytes,
+			"request_id", requestID,
+		)
+	}
+	if debugBytes, err := json.Marshal(chatResp); err == nil {
+		LogToolCallDebugOpenAIChat("service.openai_gateway.chat_completions", "buffered_openai_response", debugBytes,
+			"request_id", requestID,
+		)
+	}
 
 	if s.responseHeaderFilter != nil {
 		responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
@@ -647,9 +668,19 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 		}
 
 		chunks := apicompat.ResponsesEventToChatChunks(&event, state)
+		if debugBytes, err := json.Marshal(event); err == nil {
+			LogToolCallDebugOpenAIResponses("service.openai_gateway.chat_completions", "upstream_responses_stream_event", debugBytes,
+				"request_id", requestID,
+			)
+		}
 		if !clientDisconnected {
 			for _, chunk := range chunks {
 				refusalDetector.ObserveChatChunk(chunk)
+				if debugBytes, err := json.Marshal(chunk); err == nil {
+					LogToolCallDebugOpenAIChat("service.openai_gateway.chat_completions", "stream_openai_chunk", debugBytes,
+						"request_id", requestID,
+					)
+				}
 				sse, err := apicompat.ChatChunkToSSE(chunk)
 				if err != nil {
 					logger.L().Warn("openai chat_completions stream: failed to marshal chunk",

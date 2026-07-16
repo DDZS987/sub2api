@@ -145,6 +145,12 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletions(
 			return nil, fmt.Errorf("remove Responses-only Grok prompt cache key: %w", err)
 		}
 	}
+	LogToolCallDebugOpenAIChat("service.openai_gateway.raw_chat_completions", "upstream_request", upstreamBody,
+		"account_id", account.ID,
+		"original_model", originalModel,
+		"billing_model", billingModel,
+		"upstream_model", upstreamModel,
+	)
 
 	logger.L().Debug("openai chat_completions raw: forwarding without protocol conversion",
 		zap.Int64("account_id", account.ID),
@@ -166,7 +172,7 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletions(
 	}
 	resp, err := s.sendCCUpstreamRequest(ctx, c, account, targetURL, upstreamBody, clientStream, token, customUA, grokCacheIdentity)
 	if err != nil {
-		return nil, err
+		return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -302,6 +308,9 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 				if u := extractCCStreamUsage(payload); u != nil {
 					usage = *u
 				}
+				LogToolCallDebugOpenAIChat("service.openai_gateway.raw_chat_completions", "upstream_stream_chunk", []byte(payload),
+					"request_id", requestID,
+				)
 				if firstTokenMs == nil && !usageOnlyChunk {
 					elapsed := int(time.Since(startTime).Milliseconds())
 					firstTokenMs = &elapsed
@@ -426,6 +435,9 @@ func (s *OpenAIGatewayService) bufferRawChatCompletions(
 	if parsedUsage, ok := extractOpenAIUsageFromJSONBytes(respBody); ok {
 		usage = parsedUsage
 	}
+	LogToolCallDebugOpenAIChat("service.openai_gateway.raw_chat_completions", "upstream_buffered_response", respBody,
+		"request_id", requestID,
+	)
 
 	if s.responseHeaderFilter != nil {
 		responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)

@@ -613,10 +613,15 @@ func OpsErrorLoggerMiddleware(ops *service.OpsService) gin.HandlerFunc {
 		originalWriter := c.Writer
 		w := acquireOpsCaptureWriter(originalWriter)
 		defer func() {
-			// Restore the original writer before returning so outer middlewares
-			// don't observe a pooled wrapper that has been released.
-			if c.Writer == w {
-				c.Writer = originalWriter
+			// The capture writer is request-scoped and may have been wrapped by a
+			// downstream handler (for example, compact SSE keepalive). Always
+			// restore the writer seen on entry. If downstream retained the capture
+			// writer, do not clear or pool it while the request context can still
+			// reach it; let it be collected with the request instead.
+			retainedByDownstream := c.Writer != w
+			c.Writer = originalWriter
+			if retainedByDownstream {
+				return
 			}
 			releaseOpsCaptureWriter(w)
 		}()
