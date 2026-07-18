@@ -2914,10 +2914,9 @@ func (s *GeminiMessagesCompatService) handleGeminiUpstreamError(ctx context.Cont
 
 	oauthType := account.GeminiOAuthType()
 
-	// google_one (Gemini CLI) 账号的 429 不冻结账号：实测显示 Google 侧限流窗口极短（RPM 级），
-	// 原有逻辑会将账号封至 PST 午夜（最长 24h），与实际情况严重不符。
-	// 临时跳过 SetRateLimited，让调度器继续使用该账号；真实限流会在下一次请求中由 Google 侧响应。
-	if oauthType == "google_one" {
+	// google_one (Gemini CLI) 的普通 429 多为短暂 RPM 限流，不冻结账号；但明确的
+	// MODEL_CAPACITY_EXHAUSTED 仍使用 tier cooldown，避免立即重复请求已耗尽的容量池。
+	if oauthType == "google_one" && !geminiUpstreamErrorHasReason(body, googleRPCReasonModelCapacityExhausted) {
 		log.Printf("[Gemini 429] Account %d (Gemini CLI / Google One) received 429, skipping freeze", account.ID)
 		return
 	}
@@ -2962,6 +2961,15 @@ func (s *GeminiMessagesCompatService) handleGeminiUpstreamError(ctx context.Cont
 	_ = s.accountRepo.SetRateLimited(ctx, account.ID, resetTime)
 	logger.LegacyPrintf("service.gemini_messages_compat", "[Gemini 429] Account %d rate limited until %v (oauth_type=%s, tier=%s)",
 		account.ID, resetTime, oauthType, tierID)
+}
+
+func geminiUpstreamErrorHasReason(body []byte, target string) bool {
+	found := false
+	gjson.GetBytes(body, "error.details").ForEach(func(_, detail gjson.Result) bool {
+		found = strings.EqualFold(strings.TrimSpace(detail.Get("reason").String()), target)
+		return !found
+	})
+	return found
 }
 
 // ParseGeminiRateLimitResetTime 解析 Gemini 格式的 429 响应，返回重置时间的 Unix 时间戳

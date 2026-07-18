@@ -2,10 +2,10 @@ package repository
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -44,14 +44,14 @@ const (
 	defaultProxyProbeResponseMaxBytes = int64(1024 * 1024)
 )
 
-// probeURLs 按优先级排列的探测 URL 列表
-// 某些 AI API 专用代理只允许访问特定域名，因此需要多个备选
+// probeURLs 按优先级排列的探测 URL 列表。
+// 使用 HTTPS Cloudflare trace 端点，既能返回出口 IP，又避免把测活请求
+// 发往不必要的第三方地理位置服务。
 var probeURLs = []struct {
 	url    string
-	parser string // "ip-api" or "httpbin"
+	parser string
 }{
-	{"http://ip-api.com/json/?lang=zh-CN", "ip-api"},
-	{"http://httpbin.org/ip", "httpbin"},
+	{"https://ip.net.coffee/cdn-cgi/trace", "cloudflare-trace"},
 }
 
 type proxyProbeService struct {
@@ -117,66 +117,29 @@ func (s *proxyProbeService) probeWithURL(ctx context.Context, client *http.Clien
 	}
 
 	switch parser {
-	case "ip-api":
-		return s.parseIPAPI(body, latencyMs)
-	case "httpbin":
-		return s.parseHTTPBin(body, latencyMs)
+	case "cloudflare-trace":
+		return s.parseCloudflareTrace(body, latencyMs)
 	default:
 		return nil, latencyMs, fmt.Errorf("unknown parser: %s", parser)
 	}
 }
 
-func (s *proxyProbeService) parseIPAPI(body []byte, latencyMs int64) (*service.ProxyExitInfo, int64, error) {
-	var ipInfo struct {
-		Status      string `json:"status"`
-		Message     string `json:"message"`
-		Query       string `json:"query"`
-		City        string `json:"city"`
-		Region      string `json:"region"`
-		RegionName  string `json:"regionName"`
-		Country     string `json:"country"`
-		CountryCode string `json:"countryCode"`
-	}
-
-	if err := json.Unmarshal(body, &ipInfo); err != nil {
-		preview := string(body)
-		if len(preview) > 200 {
-			preview = preview[:200] + "..."
+func (s *proxyProbeService) parseCloudflareTrace(body []byte, latencyMs int64) (*service.ProxyExitInfo, int64, error) {
+	values := make(map[string]string)
+	for _, line := range strings.Split(string(body), "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if ok {
+			values[key] = strings.TrimSpace(value)
 		}
-		return nil, latencyMs, fmt.Errorf("failed to parse response: %w (body: %s)", err, preview)
-	}
-	if strings.ToLower(ipInfo.Status) != "success" {
-		if ipInfo.Message == "" {
-			ipInfo.Message = "ip-api request failed"
-		}
-		return nil, latencyMs, fmt.Errorf("ip-api request failed: %s", ipInfo.Message)
 	}
 
-	region := ipInfo.RegionName
-	if region == "" {
-		region = ipInfo.Region
+	ip := values["ip"]
+	if net.ParseIP(ip) == nil {
+		return nil, latencyMs, fmt.Errorf("cloudflare trace: no valid IP found in response")
 	}
-	return &service.ProxyExitInfo{
-		IP:          ipInfo.Query,
-		City:        ipInfo.City,
-		Region:      region,
-		Country:     ipInfo.Country,
-		CountryCode: ipInfo.CountryCode,
-	}, latencyMs, nil
-}
 
-func (s *proxyProbeService) parseHTTPBin(body []byte, latencyMs int64) (*service.ProxyExitInfo, int64, error) {
-	// httpbin.org/ip 返回格式: {"origin": "1.2.3.4"}
-	var result struct {
-		Origin string `json:"origin"`
-	}
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, latencyMs, fmt.Errorf("failed to parse httpbin response: %w", err)
-	}
-	if result.Origin == "" {
-		return nil, latencyMs, fmt.Errorf("httpbin: no IP found in response")
-	}
 	return &service.ProxyExitInfo{
-		IP: result.Origin,
+		IP:          ip,
+		CountryCode: values["loc"],
 	}, latencyMs, nil
 }

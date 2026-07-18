@@ -427,6 +427,27 @@ func TestHandleGeminiUpstreamError_GoogleOneCapacityExhaustedUsesTierCooldown(t 
 	require.True(t, repo.lastRateLimitReset.Before(after.Add(5*time.Minute).Add(2*time.Second)))
 }
 
+func TestHandleGeminiUpstreamError_GoogleOneGeneric429SkipsCooldown(t *testing.T) {
+	repo := &rateLimit429AccountRepoStub{}
+	svc := &GeminiMessagesCompatService{
+		accountRepo:      repo,
+		rateLimitService: NewRateLimitService(repo, nil, &config.Config{}, nil, nil),
+	}
+	account := &Account{
+		ID:       512,
+		Platform: PlatformGemini,
+		Type:     AccountTypeOAuth,
+		Credentials: map[string]any{
+			"oauth_type": "google_one",
+			"tier_id":    "google_ai_pro",
+		},
+	}
+
+	svc.handleGeminiUpstreamError(context.Background(), account, http.StatusTooManyRequests, http.Header{}, []byte(`{"error":{"code":429,"message":"rate limited"}}`))
+
+	require.Zero(t, repo.rateLimitCalls)
+}
+
 type geminiErrorPolicyRepo struct {
 	mockAccountRepoForGemini
 	setErrorCalls            int

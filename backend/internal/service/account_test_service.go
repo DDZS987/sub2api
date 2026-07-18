@@ -53,7 +53,20 @@ type TestEvent struct {
 }
 
 const (
-	defaultGeminiTextTestPrompt  = "hi"
+	defaultAccountTestPrompt = `请报告你在本次对话中实际运行的**完整、精确模型名称或模型标识**，不要只回答模型家族、系列名称、产品名称或能力等级。
+
+仅允许按以下格式回答一行：
+
+模型：<完整精确型号>
+
+例如，若实际型号是 GPT-5.6 Thinking，就必须完整回答“模型：GPT-5.6 Thinking”，不得简化为“GPT-5”“GPT-5 系列”或“GPT-5 系模型”。
+
+禁止使用“可能是”“属于某系列”“基于某模型”“大概”“类似于”等模糊措辞，也不得根据自身能力、知识截止时间或对话表现猜测型号。
+
+如果你确实无法访问本次会话的精确模型信息，仅回答：
+
+模型：无法从当前会话内部确认`
+	defaultGeminiTextTestPrompt  = defaultAccountTestPrompt
 	defaultGeminiImageTestPrompt = "Generate a cute orange cat astronaut sticker on a clean pastel background."
 	defaultOpenAIImageTestPrompt = "Generate a cute orange cat astronaut sticker on a clean pastel background."
 )
@@ -147,7 +160,7 @@ func createTestPayload(modelID string) (map[string]any, error) {
 				"content": []map[string]any{
 					{
 						"type": "text",
-						"text": "hi",
+						"text": defaultAccountTestPrompt,
 						"cache_control": map[string]string{
 							"type": "ephemeral",
 						},
@@ -422,7 +435,7 @@ func (s *AccountTestService) testBedrockAccountConnection(c *gin.Context, ctx co
 				"content": []map[string]any{
 					{
 						"type": "text",
-						"text": "hi",
+						"text": defaultAccountTestPrompt,
 					},
 				},
 			},
@@ -735,7 +748,11 @@ func (s *AccountTestService) testGrokAccountConnection(c *gin.Context, account *
 	c.Writer.Header().Set("X-Accel-Buffering", "no")
 	c.Writer.Flush()
 
-	payloadBytes, err := buildGrokQuotaProbeBody(testModelID)
+	payloadBytes, err := json.Marshal(map[string]any{
+		"model":  testModelID,
+		"input":  defaultAccountTestPrompt,
+		"stream": true,
+	})
 	if err != nil {
 		return s.sendErrorAndEnd(c, "Failed to create Grok test payload")
 	}
@@ -1432,7 +1449,7 @@ func createOpenAITestPayload(modelID string, isOAuth bool) map[string]any {
 				"content": []map[string]any{
 					{
 						"type": "input_text",
-						"text": "hi",
+						"text": defaultAccountTestPrompt,
 					},
 				},
 			},
@@ -1454,7 +1471,7 @@ func createOpenAITestPayload(modelID string, isOAuth bool) map[string]any {
 func createOpenAIChatCompletionsTestPayload(modelID string, prompt string) map[string]any {
 	testPrompt := strings.TrimSpace(prompt)
 	if testPrompt == "" {
-		testPrompt = "hi"
+		testPrompt = defaultAccountTestPrompt
 	}
 
 	return map[string]any{

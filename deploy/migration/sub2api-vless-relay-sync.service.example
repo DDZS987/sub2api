@@ -1,0 +1,11 @@
+[Unit]
+Description=Sync Sub2API VLESS relay from upstream subscription
+Wants=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=/etc/sub2api-vless-relay.env
+WorkingDirectory=/home/ubuntu/sub2api
+ExecStart=/home/ubuntu/sub2api/tools/sync_vless_relay.py

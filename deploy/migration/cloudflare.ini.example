@@ -1,0 +1,4 @@
+# 复制到目标机 /root/.secrets/certbot/cloudflare.ini 后填写。
+# Cloudflare 令牌只授予 fyai.space 区域的 Zone:DNS:Edit 权限。
+# 禁止在这里使用 Global API Key。
+dns_cloudflare_api_token = 请替换为最小权限令牌
